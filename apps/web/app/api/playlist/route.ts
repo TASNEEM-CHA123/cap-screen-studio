@@ -1,0 +1,657 @@
+import * as Db from "@cap/database/schema";
+import { serverEnv } from "@cap/env";
+import {
+	Database,
+	provideOptionalAuth,
+	Storage,
+	Videos,
+} from "@cap/web-backend";
+import { Video } from "@cap/web-domain";
+import {
+	HttpApi,
+	HttpApiBuilder,
+	HttpApiEndpoint,
+	HttpApiError,
+	HttpApiGroup,
+	HttpServerResponse,
+} from "@effect/platform";
+import { eq } from "drizzle-orm";
+import { Effect, Layer, Option, Schema } from "effect";
+import {
+	resolveMobileRequestOrigin,
+	resolveMobileWebResourceUrl,
+} from "@/lib/mobile-request-origin";
+import {
+	getEarlySegmentTracks,
+	getSegmentPlaybackState,
+	readRecordedLength,
+	totalSegmentDuration,
+} from "@/lib/segment-playback";
+import { apiToHandler } from "@/lib/server";
+import { CACHE_CONTROL_HEADERS } from "@/utils/helpers";
+import {
+	generateM3U8Playlist,
+	generateMasterPlaylist,
+} from "@/utils/video/ffmpeg/helpers";
+
+export const dynamic = "force-dynamic";
+
+const MAX_LEGACY_PLAYLIST_URIS = 10_000;
+
+const GetPlaylistParams = Schema.Struct({
+	videoId: Video.VideoId,
+	videoType: Schema.Literal(
+		"video",
+		"audio",
+		"master",
+		"mp4",
+		"raw-preview",
+		"segments-master",
+		"segments-video",
+		"segments-audio",
+		"segments-status",
+	),
+	requireComplete: Schema.OptionFromUndefinedOr(Schema.String),
+	earlyPlayback: Schema.OptionFromUndefinedOr(Schema.String),
+	thumbnail: Schema.OptionFromUndefinedOr(Schema.String),
+	fileType: Schema.OptionFromUndefinedOr(Schema.String),
+});
+
+class Api extends HttpApi.make("CapWebApi").add(
+	HttpApiGroup.make("root").add(
+		HttpApiEndpoint.get("getVideoSrc")`/api/playlist`
+			.setUrlParams(GetPlaylistParams)
+			.addError(HttpApiError.Forbidden)
+			.addError(HttpApiError.BadRequest)
+			.addError(HttpApiError.Unauthorized)
+			.addError(HttpApiError.InternalServerError)
+			.addError(HttpApiError.NotFound),
+	),
+) {}
+
+const ApiLive = HttpApiBuilder.api(Api).pipe(
+	Layer.provide(
+		HttpApiBuilder.group(Api, "root", (handlers) =>
+			Effect.gen(function* () {
+				const storage = yield* Storage;
+				const videos = yield* Videos;
+
+				return handlers.handle("getVideoSrc", ({ request, urlParams }) =>
+					Effect.gen(function* () {
+						const requestHost =
+							request.headers["x-forwarded-host"] ?? request.headers.host;
+						let requestUrl = request.originalUrl;
+						if (requestHost) {
+							try {
+								const url = new URL(requestUrl);
+								url.host = requestHost.split(",")[0]?.trim() ?? url.host;
+								requestUrl = url.toString();
+							} catch {
+								requestUrl = request.originalUrl;
+							}
+						}
+						const [video] = yield* videos
+							.getByIdForViewing(urlParams.videoId)
+							.pipe(
+								Effect.flatten,
+								Effect.catchTag("NoSuchElementException", () =>
+									Effect.fail(new HttpApiError.NotFound()),
+								),
+							);
+
+						return yield* getPlaylistResponse(
+							video,
+							urlParams,
+							resolveMobileRequestOrigin(
+								serverEnv().WEB_URL,
+								requestUrl,
+								requestHost,
+							),
+						);
+					}).pipe(
+						provideOptionalAuth,
+						Effect.tapErrorCause(Effect.logError),
+						Effect.catchTags({
+							VerifyVideoPasswordError: () =>
+								Effect.fail(new HttpApiError.Forbidden()),
+							PolicyDenied: () => Effect.fail(new HttpApiError.Unauthorized()),
+							DatabaseError: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
+							StorageError: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
+							UnknownException: () =>
+								Effect.fail(new HttpApiError.InternalServerError()),
+						}),
+						Effect.provideService(Storage, storage),
+					),
+				);
+			}),
+		),
+	),
+);
+
+const resolveRawPreviewKey = (video: Video.Video) =>
+	Effect.gen(function* () {
+		const db = yield* Database;
+		const [bucket] = yield* Storage.getAccessForVideo(video);
+		const [uploadRecord] = yield* db.use((db) =>
+			db
+				.select({ rawFileKey: Db.videoUploads.rawFileKey })
+				.from(Db.videoUploads)
+				.where(eq(Db.videoUploads.videoId, video.id)),
+		);
+
+		if (uploadRecord?.rawFileKey) {
+			return uploadRecord.rawFileKey;
+		}
+
+		if (video.source.type !== "webMP4") {
+			return yield* Effect.fail(new HttpApiError.NotFound());
+		}
+
+		const candidateKeys = [
+			`${video.ownerId}/${video.id}/raw-upload.mp4`,
+			`${video.ownerId}/${video.id}/raw-upload.webm`,
+		];
+		const headResults = yield* Effect.all(
+			candidateKeys.map((key) => bucket.headObject(key).pipe(Effect.option)),
+			{ concurrency: "unbounded" },
+		);
+		for (const [index, candidateKey] of candidateKeys.entries()) {
+			const rawHead = headResults[index];
+			if (
+				rawHead &&
+				Option.isSome(rawHead) &&
+				(rawHead.value.ContentLength ?? 0) > 0
+			) {
+				return candidateKey;
+			}
+		}
+
+		return yield* Effect.fail(new HttpApiError.NotFound());
+	});
+
+const getPlaylistResponse = (
+	video: Video.Video,
+	urlParams: (typeof GetPlaylistParams)["Type"],
+	publicOrigin: string,
+) =>
+	Effect.gen(function* () {
+		const [bucket, customBucket] = yield* Storage.getAccessForVideo(video);
+		const source = Video.Video.getSource(video);
+		const isMp4Source = source instanceof Video.Mp4Source;
+		const mp4Key = isMp4Source
+			? source.getFileKey()
+			: `${video.ownerId}/${video.id}/result.mp4`;
+
+		if (urlParams.videoType === "raw-preview") {
+			const rawFileKey = yield* resolveRawPreviewKey(video);
+			return yield* bucket
+				.getSignedObjectUrl(rawFileKey)
+				.pipe(Effect.map(HttpServerResponse.redirect));
+		}
+
+		if (
+			urlParams.videoType === "segments-master" ||
+			urlParams.videoType === "segments-video" ||
+			urlParams.videoType === "segments-audio" ||
+			urlParams.videoType === "segments-status"
+		) {
+			const segSource = new Video.SegmentsSource({
+				videoId: video.id,
+				ownerId: video.ownerId,
+			});
+
+			const manifestKey = segSource.getManifestKey();
+			const manifestContent = yield* bucket.getObject(manifestKey).pipe(
+				Effect.andThen(
+					Option.match({
+						onNone: () => Effect.fail(new HttpApiError.NotFound()),
+						onSome: (c) => Effect.succeed(c),
+					}),
+				),
+			);
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(manifestContent);
+			} catch {
+				return yield* Effect.fail(new HttpApiError.InternalServerError());
+			}
+
+			let manifest = yield* Schema.decodeUnknown(Video.SegmentManifest)(
+				parsed,
+			).pipe(Effect.mapError(() => new HttpApiError.InternalServerError()));
+			if (
+				manifest.version === 1 &&
+				manifest.is_complete &&
+				!manifest.audio_init_uploaded &&
+				manifest.audio_segments.length > 0
+			) {
+				const audioInitKey = segSource.getAudioInitKey();
+				const objects = yield* bucket.listObjects({
+					prefix: audioInitKey,
+					maxKeys: 1,
+				});
+				if (
+					objects.Contents?.some(
+						(object) => object.Key === audioInitKey && (object.Size ?? 0) > 0,
+					)
+				) {
+					manifest = { ...manifest, audio_init_uploaded: true };
+				}
+			}
+			const playbackState = getSegmentPlaybackState(manifest);
+			if (playbackState === "incomplete") {
+				return HttpServerResponse.empty({
+					status: 409,
+					headers: CACHE_CONTROL_HEADERS,
+				});
+			}
+			const requireComplete = Option.match(urlParams.requireComplete, {
+				onNone: () => false,
+				onSome: (value) => value === "1" || value === "true",
+			});
+			const earlyPlayback =
+				!requireComplete &&
+				Option.match(urlParams.earlyPlayback, {
+					onNone: () => false,
+					onSome: (value) => value === "1",
+				});
+			const earlyTracks = earlyPlayback
+				? getEarlySegmentTracks(manifest)
+				: null;
+			const waitsForComplete = requireComplete || earlyPlayback;
+			const hasVideoSegments =
+				manifest.video_init_uploaded && manifest.video_segments.length > 0;
+			if (urlParams.videoType === "segments-status") {
+				const status =
+					earlyTracks !== null ||
+					(hasVideoSegments && (!waitsForComplete || playbackState === "ready"))
+						? 204
+						: 202;
+				const headers: Record<string, string> = {
+					...CACHE_CONTROL_HEADERS,
+					"X-Cap-Recording-Complete": playbackState === "ready" ? "1" : "0",
+				};
+				if (earlyPlayback && status === 204) {
+					const complete = playbackState === "ready";
+					const fullLength = totalSegmentDuration(
+						manifest.video_segments.map(Video.normalizeSegmentEntry),
+					);
+					const readyDuration = earlyTracks
+						? Math.min(
+								totalSegmentDuration(earlyTracks.video),
+								totalSegmentDuration(earlyTracks.audio),
+							)
+						: fullLength;
+					const recordedDuration = complete
+						? fullLength
+						: yield* bucket
+								.getObject(
+									`${video.ownerId}/${video.id}/segments/recording.json`,
+								)
+								.pipe(
+									Effect.map(
+										Option.match({
+											onNone: () => null,
+											onSome: (content) =>
+												readRecordedLength(content, readyDuration),
+										}),
+									),
+									Effect.catchAll(() => Effect.succeed(null)),
+								);
+					headers["X-Cap-Ready-Duration"] = readyDuration.toFixed(3);
+					if (recordedDuration !== null)
+						headers["X-Cap-Recorded-Duration"] = recordedDuration.toFixed(3);
+				}
+				return HttpServerResponse.empty({ status, headers });
+			}
+			if (waitsForComplete && !manifest.is_complete && earlyTracks === null) {
+				return yield* Effect.fail(new HttpApiError.NotFound());
+			}
+
+			if (urlParams.videoType === "segments-master") {
+				if (!hasVideoSegments) {
+					return yield* Effect.fail(new HttpApiError.NotFound());
+				}
+
+				const videoPlaylistUrl = `/api/playlist?videoId=${video.id}&videoType=segments-video`;
+				const requireCompleteSuffix = requireComplete
+					? "&requireComplete=1"
+					: earlyPlayback
+						? "&earlyPlayback=1"
+						: "";
+				const audioPlaylistUrl =
+					earlyTracks !== null ||
+					(manifest.audio_init_uploaded && manifest.audio_segments.length > 0)
+						? `/api/playlist?videoId=${video.id}&videoType=segments-audio${requireCompleteSuffix}`
+						: null;
+
+				let playlist =
+					"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n";
+				if (earlyPlayback) playlist += "#EXT-X-START:TIME-OFFSET=0\n";
+				if (audioPlaylistUrl) {
+					playlist += `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="default",DEFAULT=YES,AUTOSELECT=YES,URI="${audioPlaylistUrl}"\n`;
+					playlist += `#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="audio"\n`;
+				} else {
+					playlist += "#EXT-X-STREAM-INF:BANDWIDTH=2000000\n";
+				}
+				playlist += `${videoPlaylistUrl}${requireCompleteSuffix}\n`;
+
+				return HttpServerResponse.text(playlist, {
+					headers: {
+						...CACHE_CONTROL_HEADERS,
+						"Content-Type": "application/vnd.apple.mpegurl",
+					},
+				});
+			}
+
+			const isVideo = urlParams.videoType === "segments-video";
+			const initKey = isVideo
+				? segSource.getVideoInitKey()
+				: segSource.getAudioInitKey();
+			const segments = earlyTracks
+				? isVideo
+					? earlyTracks.video
+					: earlyTracks.audio
+				: (isVideo ? manifest.video_segments : manifest.audio_segments).map(
+						Video.normalizeSegmentEntry,
+					);
+			const initUploaded = isVideo
+				? manifest.video_init_uploaded
+				: manifest.audio_init_uploaded;
+
+			if (!initUploaded || segments.length === 0) {
+				return yield* Effect.fail(new HttpApiError.NotFound());
+			}
+
+			const signedInitUrl = yield* bucket.getSignedObjectUrl(initKey);
+			const initUrl = resolveMobileWebResourceUrl(
+				signedInitUrl,
+				serverEnv().WEB_URL,
+				publicOrigin,
+			);
+			const segmentUrls = yield* Effect.all(
+				segments.map((seg) => {
+					const key = isVideo
+						? segSource.getVideoSegmentKey(seg.index)
+						: segSource.getAudioSegmentKey(seg.index);
+					return bucket
+						.getSignedObjectUrl(key)
+						.pipe(
+							Effect.map((url) =>
+								resolveMobileWebResourceUrl(
+									url,
+									serverEnv().WEB_URL,
+									publicOrigin,
+								),
+							),
+						);
+				}),
+				{ concurrency: "unbounded" },
+			);
+
+			const targetDuration = Math.ceil(
+				segments.reduce((max, seg) => Math.max(max, seg.duration), 0),
+			);
+
+			let playlist = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${Math.max(targetDuration, 1)}\n#EXT-X-MEDIA-SEQUENCE:0\n`;
+			if (earlyPlayback) {
+				// A playlist type must not change, and EVENT lets players seek
+				// anywhere from the first segment while it grows.
+				playlist += "#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-START:TIME-OFFSET=0\n";
+			} else if (manifest.is_complete) {
+				playlist += "#EXT-X-PLAYLIST-TYPE:VOD\n";
+			}
+			playlist += `#EXT-X-MAP:URI="${initUrl}"\n`;
+
+			for (let i = 0; i < segmentUrls.length; i++) {
+				const dur = segments[i]?.duration ?? 3.0;
+				playlist += `#EXTINF:${dur.toFixed(3)},\n`;
+				playlist += `${segmentUrls[i]}\n`;
+			}
+
+			if (manifest.is_complete) {
+				playlist += "#EXT-X-ENDLIST\n";
+			}
+
+			return HttpServerResponse.text(playlist, {
+				headers: {
+					...CACHE_CONTROL_HEADERS,
+					"Content-Type": "application/vnd.apple.mpegurl",
+				},
+			});
+		}
+
+		if (bucket.provider === "s3" && Option.isNone(customBucket)) {
+			if (isMp4Source || urlParams.videoType === "mp4") {
+				return HttpServerResponse.redirect(
+					yield* bucket.getSignedObjectUrl(mp4Key),
+				);
+			}
+
+			const readPlaylist = (key: string) =>
+				bucket.getObject(key).pipe(
+					Effect.flatMap(
+						Option.match({
+							onNone: () => Effect.fail(new HttpApiError.NotFound()),
+							onSome: (text) => Effect.succeed({ key, text }),
+						}),
+					),
+				);
+
+			let playlist = yield* readPlaylist(
+				video.source.type === "MediaConvert"
+					? `${video.ownerId}/${video.id}/output/video_recording_000.m3u8`
+					: `${video.ownerId}/${video.id}/combined-source/stream.m3u8`,
+			);
+
+			// Each URI resolves against the playlist's own folder, and a signed
+			// playlist URL does not carry over to them, so every one is signed here.
+			const resolveUri = (uri: string) =>
+				`${playlist.key.slice(0, playlist.key.lastIndexOf("/") + 1)}${uri}`;
+			const isUriLine = (line: string) =>
+				line.length > 0 && !line.startsWith("#") && !/^[a-z]+:/i.test(line);
+
+			// A multivariant playlist would hand the player relative child
+			// playlists, so its first rendition is served in its place.
+			if (playlist.text.includes("#EXT-X-STREAM-INF")) {
+				const variant = playlist.text
+					.split("\n")
+					.map((line) => line.trim())
+					.find(isUriLine);
+				if (!variant) return yield* Effect.fail(new HttpApiError.NotFound());
+				playlist = yield* readPlaylist(resolveUri(variant));
+			}
+
+			const playlistLines = playlist.text.split("\n");
+			// Legacy segments run 3-4 s, so this covers recordings of several
+			// hours while bounding the signing work a single request can cause.
+			if (
+				playlistLines.filter((line) => isUriLine(line.trim())).length >
+				MAX_LEGACY_PLAYLIST_URIS
+			) {
+				return yield* Effect.fail(new HttpApiError.BadRequest());
+			}
+
+			const lines = yield* Effect.forEach(
+				playlistLines,
+				(line) => {
+					const uri = line.trim();
+					return isUriLine(uri)
+						? bucket.getSignedObjectUrl(resolveUri(uri))
+						: Effect.succeed(line);
+				},
+				{ concurrency: 16 },
+			);
+
+			return HttpServerResponse.text(lines.join("\n"), {
+				headers: {
+					...CACHE_CONTROL_HEADERS,
+					"Content-Type": "application/vnd.apple.mpegurl",
+				},
+			});
+		}
+
+		if (
+			Option.isSome(urlParams.fileType) &&
+			urlParams.fileType.value === "transcription"
+		) {
+			return yield* bucket
+				.getObject(`${video.ownerId}/${video.id}/transcription.vtt`)
+				.pipe(
+					Effect.andThen(
+						Option.match({
+							onNone: () => Effect.fail(new HttpApiError.NotFound()),
+							onSome: (c) =>
+								HttpServerResponse.text(c).pipe(
+									HttpServerResponse.setHeaders({
+										...CACHE_CONTROL_HEADERS,
+										"Content-Type": "text/vtt",
+									}),
+								),
+						}),
+					),
+					Effect.withSpan("fetchTranscription"),
+				);
+		}
+
+		if (
+			Option.isSome(urlParams.fileType) &&
+			urlParams.fileType.value === "enhanced-audio"
+		) {
+			const enhancedAudioKey = `${video.ownerId}/${video.id}/enhanced-audio.mp3`;
+			return yield* bucket.getSignedObjectUrl(enhancedAudioKey).pipe(
+				Effect.map(HttpServerResponse.redirect),
+				Effect.catchTag("StorageError", () =>
+					Effect.fail(new HttpApiError.NotFound()),
+				),
+				Effect.withSpan("fetchEnhancedAudio"),
+			);
+		}
+
+		yield* Effect.log("Resolving path with custom bucket");
+
+		const videoPrefix = `${video.ownerId}/${video.id}/video/`;
+		const audioPrefix = `${video.ownerId}/${video.id}/audio/`;
+
+		return yield* Effect.gen(function* () {
+			if (video.source.type === "local") {
+				const playlistText =
+					(yield* bucket.getObject(
+						`${video.ownerId}/${video.id}/combined-source/stream.m3u8`,
+					)).pipe(Option.getOrNull) ?? "";
+
+				const lines = playlistText.split("\n");
+
+				for (const [index, line] of lines.entries()) {
+					if (line.endsWith(".ts")) {
+						const url = yield* bucket.getSignedObjectUrl(
+							`${video.ownerId}/${video.id}/combined-source/${line}`,
+						);
+						lines[index] = url;
+					}
+				}
+
+				const playlist = lines.join("\n");
+
+				return HttpServerResponse.text(playlist, {
+					headers: {
+						...CACHE_CONTROL_HEADERS,
+						"Content-Type": "application/vnd.apple.mpegurl",
+					},
+				});
+			} else if (isMp4Source) {
+				yield* Effect.log(`Returning path ${mp4Key}`);
+				return yield* bucket
+					.getSignedObjectUrl(mp4Key)
+					.pipe(Effect.map(HttpServerResponse.redirect));
+			}
+
+			if (urlParams.videoType === "master") {
+				const [videoSegment, audioSegment] = yield* Effect.all([
+					bucket.listObjects({ prefix: videoPrefix, maxKeys: 1 }),
+					bucket.listObjects({ prefix: audioPrefix, maxKeys: 1 }),
+				]);
+
+				const videoSegmentKey = videoSegment.Contents?.[0]?.Key;
+				if (!videoSegmentKey) {
+					return yield* Effect.fail(new HttpApiError.NotFound());
+				}
+
+				const videoMetadata = yield* bucket.headObject(videoSegmentKey);
+				const audioMetadata =
+					audioSegment?.KeyCount && audioSegment.KeyCount > 0
+						? audioSegment.Contents?.[0]?.Key
+							? yield* bucket.headObject(audioSegment.Contents[0].Key)
+							: undefined
+						: undefined;
+
+				const generatedPlaylist = generateMasterPlaylist(
+					videoMetadata?.Metadata?.resolution ?? "",
+					videoMetadata?.Metadata?.bandwidth ?? "",
+					`/api/playlist?videoId=${video.id}&videoType=video`,
+					audioMetadata
+						? `/api/playlist?videoId=${video.id}&videoType=audio`
+						: null,
+				);
+
+				return HttpServerResponse.text(generatedPlaylist, {
+					headers: {
+						...CACHE_CONTROL_HEADERS,
+						"Content-Type": "application/vnd.apple.mpegurl",
+					},
+				});
+			}
+
+			const prefix =
+				urlParams.videoType === "video"
+					? videoPrefix
+					: urlParams.videoType === "audio"
+						? audioPrefix
+						: undefined;
+
+			if (!prefix) {
+				return yield* Effect.fail(new HttpApiError.NotFound());
+			}
+
+			const objects = yield* bucket.listObjects({
+				prefix,
+				maxKeys: urlParams.thumbnail ? 1 : undefined,
+			});
+
+			const chunksUrls = yield* Effect.all(
+				(objects.Contents || []).map((object) =>
+					Effect.gen(function* () {
+						const url = yield* bucket.getSignedObjectUrl(object.Key ?? "");
+						const metadata = yield* bucket.headObject(object.Key ?? "");
+
+						return {
+							url: url,
+							duration: metadata?.Metadata?.duration ?? "",
+							bandwidth: metadata?.Metadata?.bandwidth ?? "",
+							resolution: metadata?.Metadata?.resolution ?? "",
+							videoCodec: metadata?.Metadata?.videocodec ?? "",
+							audioCodec: metadata?.Metadata?.audiocodec ?? "",
+						};
+					}),
+				),
+				{ concurrency: "unbounded" },
+			);
+
+			const generatedPlaylist = generateM3U8Playlist(chunksUrls);
+
+			return HttpServerResponse.text(generatedPlaylist, {
+				headers: {
+					...CACHE_CONTROL_HEADERS,
+					"Content-Type": "application/vnd.apple.mpegurl",
+				},
+			});
+		}).pipe(Effect.withSpan("generateUrls"));
+	});
+
+const handler = apiToHandler(ApiLive);
+
+export const GET = (r: Request) => handler(r);
+export const HEAD = (r: Request) => handler(r);

@@ -1,0 +1,61 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(scriptDir, "..");
+const desktopManifest = path.join(
+	repoRoot,
+	"apps",
+	"desktop-gpui",
+	"Cargo.toml",
+);
+// The bundled `cap` CLI reports its own version (`cap --version`, MCP server
+// info, `cap doctor`), so it ships with the desktop version too.
+const cliManifest = path.join(repoRoot, "apps", "cli", "Cargo.toml");
+
+function packageVersion(source, manifestPath) {
+	const packageStart = source.indexOf("[package]");
+	const packageEnd = source.indexOf("\n[", packageStart + 1);
+	const section = source.slice(
+		packageStart,
+		packageEnd === -1 ? source.length : packageEnd,
+	);
+	const match = /^version\s*=\s*"([^"]+)"$/m.exec(section);
+	if (!match) throw new Error(`package.version not found in ${manifestPath}`);
+	return match[1];
+}
+
+function replacePackageVersion(source, manifestPath, version) {
+	const packageStart = source.indexOf("[package]");
+	const packageEnd = source.indexOf("\n[", packageStart + 1);
+	const end = packageEnd === -1 ? source.length : packageEnd;
+	const section = source.slice(packageStart, end);
+	const nextSection = section.replace(
+		/^version\s*=\s*"[^"]+"$/m,
+		`version = "${version}"`,
+	);
+	if (nextSection === section)
+		throw new Error(`package.version not found in ${manifestPath}`);
+	return source.slice(0, packageStart) + nextSection + source.slice(end);
+}
+
+const [desktopSource, cliSource] = await Promise.all([
+	fs.readFile(desktopManifest, "utf8"),
+	fs.readFile(cliManifest, "utf8"),
+]);
+const version = packageVersion(desktopSource, desktopManifest);
+const cliVersion = packageVersion(cliSource, cliManifest);
+
+if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version))
+	throw new Error(`Invalid desktop version: ${version}`);
+
+if (cliVersion !== version) {
+	await fs.writeFile(
+		cliManifest,
+		replacePackageVersion(cliSource, cliManifest, version),
+	);
+	console.log(`Synchronized Cap CLI ${cliVersion} -> ${version}`);
+} else {
+	console.log(`Cap desktop and CLI versions match: ${version}`);
+}

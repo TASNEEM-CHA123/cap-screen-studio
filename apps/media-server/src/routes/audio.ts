@@ -1,0 +1,317 @@
+import { type Context, Hono } from "hono";
+import { z } from "zod";
+import { canReadStatus, validateMediaServerSecret } from "../lib/auth";
+import {
+	DRAIN_RETRY_AFTER_SECONDS,
+	DRAINING_DETAILS,
+	getIdleTimeoutSeconds,
+	isDraining,
+	restoreIdleTimeoutOnFirstChunk,
+	setRequestIdleTimeout,
+} from "../lib/lifecycle";
+import {
+	canAcceptNewAudioOperation as canAcceptNewProcess,
+	checkHasAudioTrack,
+	extractAudio,
+	extractAudioStream,
+	getActiveAudioOperationCount as getActiveProcessCount,
+} from "../lib/media-audio";
+
+const audio = new Hono();
+const MEDIA_ENGINE_ERROR_CODE = ["FF", "MPEG_ERROR"].join("");
+// A streamed MP3 of a multi-hour recording takes minutes to encode, so the
+// default 2-minute extraction limit would cut it off mid-response.
+const STREAMED_AUDIO_TIMEOUT_MS = 15 * 60 * 1000;
+
+const videoUrlSchema = z.object({
+	videoUrl: z.string().url(),
+});
+
+const extractSchema = z.object({
+	videoUrl: z.string().url(),
+	stream: z.boolean().optional().default(true),
+});
+
+const convertSchema = z.object({
+	audioUrl: z.string().url(),
+	outputFormat: z.literal("mp3").optional().default("mp3"),
+	bitrate: z.string().optional().default("128k"),
+});
+
+function isBusyError(err: unknown): boolean {
+	return err instanceof Error && err.message.includes("Server is busy");
+}
+
+function isTimeoutError(err: unknown): boolean {
+	return err instanceof Error && err.message.includes("timed out");
+}
+
+function drainingResponse(c: Context) {
+	c.header("Retry-After", DRAIN_RETRY_AFTER_SECONDS.toString());
+	return c.json(
+		{
+			error: "Server is busy",
+			code: "SERVER_BUSY",
+			details: DRAINING_DETAILS,
+		},
+		503,
+	);
+}
+
+audio.get("/status", (c) => {
+	if (!canReadStatus(c)) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+	return c.json({
+		activeProcesses: getActiveProcessCount(),
+		canAcceptNewProcess: canAcceptNewProcess(),
+	});
+});
+
+audio.post("/check", async (c) => {
+	if (!validateMediaServerSecret(c)) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+
+	const body = await c.req.json();
+	const result = videoUrlSchema.safeParse(body);
+
+	if (!result.success) {
+		return c.json(
+			{
+				error: "Invalid request",
+				code: "INVALID_REQUEST",
+				details: result.error.message,
+			},
+			400,
+		);
+	}
+
+	if (isDraining()) return drainingResponse(c);
+
+	try {
+		const hasAudio = await checkHasAudioTrack(result.data.videoUrl);
+		return c.json({ hasAudio });
+	} catch (err) {
+		console.error("[audio/check] Error:", err);
+
+		if (isBusyError(err)) {
+			return c.json(
+				{
+					error: "Server is busy",
+					code: "SERVER_BUSY",
+					details: "Too many concurrent requests, please retry later",
+				},
+				503,
+			);
+		}
+
+		if (isTimeoutError(err)) {
+			return c.json(
+				{
+					error: "Request timed out",
+					code: "TIMEOUT",
+					details: err instanceof Error ? err.message : String(err),
+				},
+				504,
+			);
+		}
+
+		return c.json(
+			{
+				error: "Failed to check audio track",
+				code: MEDIA_ENGINE_ERROR_CODE,
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	}
+});
+
+audio.post("/extract", async (c) => {
+	if (!validateMediaServerSecret(c)) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+
+	const body = await c.req.json();
+	const result = extractSchema.safeParse(body);
+
+	if (!result.success) {
+		return c.json(
+			{
+				error: "Invalid request",
+				code: "INVALID_REQUEST",
+				details: result.error.message,
+			},
+			400,
+		);
+	}
+
+	const { videoUrl, stream: useStreaming } = result.data;
+	if (isDraining()) return drainingResponse(c);
+	setRequestIdleTimeout(c.env, c.req.raw, 0);
+	const restoreIdleTimeout = () =>
+		setRequestIdleTimeout(c.env, c.req.raw, getIdleTimeoutSeconds());
+	let streaming = false;
+
+	try {
+		const hasAudio = await checkHasAudioTrack(videoUrl);
+		if (!hasAudio) {
+			return c.json(
+				{ error: "Video has no audio track", code: "NO_AUDIO_TRACK" },
+				422,
+			);
+		}
+
+		if (useStreaming) {
+			const { stream, cleanup } = extractAudioStream(videoUrl, {
+				timeoutMs: STREAMED_AUDIO_TIMEOUT_MS,
+			});
+
+			c.req.raw.signal.addEventListener("abort", () => {
+				cleanup();
+			});
+
+			streaming = true;
+			return new Response(
+				restoreIdleTimeoutOnFirstChunk(stream, restoreIdleTimeout),
+				{
+					headers: {
+						"Content-Type": "audio/mpeg",
+						"Transfer-Encoding": "chunked",
+					},
+				},
+			);
+		}
+
+		const audioData = await extractAudio(videoUrl);
+
+		return new Response(Buffer.from(audioData), {
+			headers: {
+				"Content-Type": "audio/mpeg",
+				"Content-Length": audioData.length.toString(),
+			},
+		});
+	} catch (err) {
+		console.error("[audio/extract] Error:", err);
+
+		if (isBusyError(err)) {
+			return c.json(
+				{
+					error: "Server is busy",
+					code: "SERVER_BUSY",
+					details: "Too many concurrent requests, please retry later",
+				},
+				503,
+			);
+		}
+
+		if (isTimeoutError(err)) {
+			return c.json(
+				{
+					error: "Request timed out",
+					code: "TIMEOUT",
+					details: err instanceof Error ? err.message : String(err),
+				},
+				504,
+			);
+		}
+
+		return c.json(
+			{
+				error: "Failed to extract audio",
+				code: MEDIA_ENGINE_ERROR_CODE,
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	} finally {
+		if (!streaming) restoreIdleTimeout();
+	}
+});
+
+audio.post("/convert", async (c) => {
+	if (!validateMediaServerSecret(c)) {
+		return c.json({ error: "Unauthorized" }, 401);
+	}
+
+	const body = await c.req.json();
+	const result = convertSchema.safeParse(body);
+
+	if (!result.success) {
+		return c.json(
+			{
+				error: "Invalid request",
+				code: "INVALID_REQUEST",
+				details: result.error.message,
+			},
+			400,
+		);
+	}
+
+	const { audioUrl, bitrate } = result.data;
+	if (isDraining()) return drainingResponse(c);
+	setRequestIdleTimeout(c.env, c.req.raw, 0);
+	const restoreIdleTimeout = () =>
+		setRequestIdleTimeout(c.env, c.req.raw, getIdleTimeoutSeconds());
+	let streaming = false;
+
+	try {
+		const { stream, cleanup } = extractAudioStream(audioUrl, {
+			bitrate,
+			timeoutMs: STREAMED_AUDIO_TIMEOUT_MS,
+		});
+
+		c.req.raw.signal.addEventListener("abort", () => {
+			cleanup();
+		});
+
+		streaming = true;
+		return new Response(
+			restoreIdleTimeoutOnFirstChunk(stream, restoreIdleTimeout),
+			{
+				headers: {
+					"Content-Type": "audio/mpeg",
+					"Transfer-Encoding": "chunked",
+				},
+			},
+		);
+	} catch (err) {
+		console.error("[audio/convert] Error:", err);
+
+		if (isBusyError(err)) {
+			return c.json(
+				{
+					error: "Server is busy",
+					code: "SERVER_BUSY",
+					details: "Too many concurrent requests, please retry later",
+				},
+				503,
+			);
+		}
+
+		if (isTimeoutError(err)) {
+			return c.json(
+				{
+					error: "Request timed out",
+					code: "TIMEOUT",
+					details: err instanceof Error ? err.message : String(err),
+				},
+				504,
+			);
+		}
+
+		return c.json(
+			{
+				error: "Failed to convert audio",
+				code: MEDIA_ENGINE_ERROR_CODE,
+				details: err instanceof Error ? err.message : String(err),
+			},
+			500,
+		);
+	} finally {
+		if (!streaming) restoreIdleTimeout();
+	}
+});
+
+export default audio;

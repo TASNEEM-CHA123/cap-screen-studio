@@ -1,0 +1,167 @@
+"use server";
+
+import { db } from "@cap/database";
+import { getCurrentUser } from "@cap/database/auth/session";
+import { importedVideos, videos, videoUploads } from "@cap/database/schema";
+import type { Video } from "@cap/web-domain";
+import { and, eq } from "drizzle-orm";
+import {
+	getLoomImportRunState,
+	LOOM_IMPORT_CONFIRMATION_MESSAGE,
+	LoomImportStartError,
+	restoreLoomImportStartError,
+	startLoomImportWorkflow,
+} from "@/lib/loom-import-start";
+import {
+	startVideoProcessingWorkflow,
+	type VideoProcessingStartStatus,
+} from "@/lib/video-processing";
+
+const SECOND = 1000;
+const MINUTE = 60 * SECOND;
+const STALE_PROCESSING_START_MS = 90 * SECOND;
+const STALE_PROCESSING_PROGRESS_MS = 10 * MINUTE;
+const STALE_THUMBNAIL_MS = 5 * MINUTE;
+
+const shouldForceRetryProcessing = (upload: {
+	phase: string;
+	updatedAt: Date;
+	processingProgress: number;
+}) => {
+	const ageMs = Date.now() - upload.updatedAt.getTime();
+
+	if (upload.phase === "processing") {
+		if (upload.processingProgress === 0 && ageMs > STALE_PROCESSING_START_MS) {
+			return true;
+		}
+
+		return ageMs > STALE_PROCESSING_PROGRESS_MS;
+	}
+
+	if (upload.phase === "generating_thumbnail") {
+		return ageMs > STALE_THUMBNAIL_MS;
+	}
+
+	return false;
+};
+
+export async function retryVideoProcessing({
+	videoId,
+}: {
+	videoId: Video.VideoId;
+}): Promise<{ success: boolean; status: VideoProcessingStartStatus }> {
+	const user = await getCurrentUser();
+	if (!user) throw new Error("Unauthorized");
+
+	const [video] = await db()
+		.select()
+		.from(videos)
+		.where(eq(videos.id, videoId));
+
+	if (!video) throw new Error("Video not found");
+	if (video.ownerId !== user.id) throw new Error("Unauthorized");
+
+	const [upload] = await db()
+		.select()
+		.from(videoUploads)
+		.where(eq(videoUploads.videoId, videoId));
+
+	if (!upload) throw new Error("No upload record found");
+
+	const [importedVideo] = await db()
+		.select({
+			source: importedVideos.source,
+			sourceId: importedVideos.sourceId,
+		})
+		.from(importedVideos)
+		.where(
+			and(
+				eq(importedVideos.id, videoId),
+				eq(importedVideos.orgId, video.orgId),
+			),
+		);
+
+	if (importedVideo?.source === "loom") {
+		const runState = await getLoomImportRunState(video.metadata?.loomImportRun);
+		if (runState === "unconfirmed") {
+			throw new Error(LOOM_IMPORT_CONFIRMATION_MESSAGE);
+		}
+		if (
+			runState !== "inactive" ||
+			upload.phase === "uploading" ||
+			((upload.phase === "processing" ||
+				upload.phase === "generating_thumbnail") &&
+				!shouldForceRetryProcessing(upload))
+		) {
+			return { success: true, status: "already-processing" };
+		}
+
+		const rawFileKey =
+			upload.rawFileKey ?? `${video.ownerId}/${videoId}/raw-upload.mp4`;
+		const claimedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
+		const claim = await db()
+			.update(videoUploads)
+			.set({
+				phase: "processing",
+				processingProgress: 0,
+				processingMessage: "Retrying Loom import...",
+				processingError: null,
+				rawFileKey,
+				updatedAt: claimedAt,
+			})
+			.where(
+				and(
+					eq(videoUploads.videoId, videoId),
+					eq(videoUploads.phase, upload.phase),
+					eq(videoUploads.updatedAt, upload.updatedAt),
+				),
+			);
+		const affectedRows = Array.isArray(claim)
+			? (claim[0] as { affectedRows?: number } | undefined)?.affectedRows
+			: (claim as { affectedRows?: number }).affectedRows;
+		if (affectedRows !== 1) {
+			return { success: true, status: "already-processing" };
+		}
+
+		try {
+			await startLoomImportWorkflow({
+				videoId,
+				userId: user.id,
+				rawFileKey,
+				bucketId: video.bucket ?? null,
+				loomDownloadUrl: "",
+				loomVideoId: importedVideo.sourceId,
+				reuseExistingRawUpload: true,
+			});
+		} catch (error) {
+			const normalizedError =
+				error instanceof Error
+					? error
+					: new Error("Loom import could not restart");
+			if (error instanceof LoomImportStartError && error.canRetry) {
+				await restoreLoomImportStartError(
+					videoId,
+					"processing",
+					claimedAt,
+					error.message,
+				);
+			}
+			throw normalizedError;
+		}
+
+		return { success: true, status: "started" };
+	}
+
+	if (!upload.rawFileKey) throw new Error("No raw file key found for retry");
+	const status = await startVideoProcessingWorkflow({
+		videoId,
+		userId: user.id,
+		rawFileKey: upload.rawFileKey,
+		bucketId: video.bucket ?? null,
+		processingMessage: "Retrying video processing...",
+		startFailureMessage: "Video processing could not restart.",
+		forceRestart: shouldForceRetryProcessing(upload),
+	});
+
+	return { success: true, status };
+}

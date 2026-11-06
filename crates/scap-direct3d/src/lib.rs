@@ -1,0 +1,1070 @@
+#![cfg(windows)]
+
+mod windows_version;
+
+pub use windows_version::WindowsVersion;
+
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::RecvError,
+    },
+    time::{Duration, Instant},
+};
+use windows::{
+    Foundation::{Metadata::ApiInformation, TypedEventHandler},
+    Graphics::{
+        Capture::{
+            Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+            GraphicsCaptureSession,
+        },
+        DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
+    },
+    Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
+            Direct3D11::{
+                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ,
+                D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
+                ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+            },
+            Dxgi::{
+                Common::{
+                    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_SAMPLE_DESC,
+                },
+                DXGI_ERROR_UNSUPPORTED, IDXGIDevice,
+            },
+        },
+        System::WinRT::Direct3D11::{
+            CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+        },
+    },
+    core::{HSTRING, IInspectable, Interface},
+};
+
+#[derive(Default, Clone, Copy, Debug)]
+#[repr(i32)]
+pub enum PixelFormat {
+    #[default]
+    R8G8B8A8Unorm,
+    B8G8R8A8Unorm,
+}
+
+impl PixelFormat {
+    pub fn as_directx(&self) -> DirectXPixelFormat {
+        match self {
+            Self::R8G8B8A8Unorm => DirectXPixelFormat::R8G8B8A8UIntNormalized,
+            Self::B8G8R8A8Unorm => DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        }
+    }
+
+    pub fn as_dxgi(&self) -> DXGI_FORMAT {
+        match self {
+            Self::R8G8B8A8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
+            Self::B8G8R8A8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+        }
+    }
+}
+
+const STAGING_POOL_SIZE: usize = 3;
+
+struct CallbackActivity {
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl CallbackActivity {
+    fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn enter(self: &Arc<Self>) -> CallbackActivityGuard {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active += 1;
+
+        CallbackActivityGuard {
+            activity: self.clone(),
+        }
+    }
+
+    fn leave(&self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if *active > 0 {
+            *active -= 1;
+        }
+
+        if *active == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn wait_idle(&self, timeout: Duration) {
+        let started = Instant::now();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        while *active > 0 {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match self.idle.wait_timeout(active, remaining) {
+                Ok((next_guard, wait_result)) => {
+                    active = next_guard;
+                    if wait_result.timed_out() {
+                        break;
+                    }
+                }
+                Err(poisoned) => {
+                    let (next_guard, _) = poisoned.into_inner();
+                    active = next_guard;
+                }
+            }
+        }
+    }
+}
+
+struct CallbackActivityGuard {
+    activity: Arc<CallbackActivity>,
+}
+
+impl Drop for CallbackActivityGuard {
+    fn drop(&mut self) {
+        self.activity.leave();
+    }
+}
+
+struct PooledStagingTexture {
+    texture: ID3D11Texture2D,
+    width: u32,
+    height: u32,
+}
+
+pub struct StagingTexturePool {
+    textures: Mutex<Vec<PooledStagingTexture>>,
+    d3d_device: ID3D11Device,
+    pixel_format: PixelFormat,
+    next_index: AtomicUsize,
+}
+
+impl StagingTexturePool {
+    fn new(d3d_device: ID3D11Device, pixel_format: PixelFormat) -> Self {
+        Self {
+            textures: Mutex::new(Vec::with_capacity(STAGING_POOL_SIZE)),
+            d3d_device,
+            pixel_format,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_or_create_texture(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<ID3D11Texture2D> {
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let index = self.next_index.fetch_add(1, Ordering::Relaxed) % STAGING_POOL_SIZE;
+
+        if let Some(pooled) = textures.get(index)
+            && pooled.width == width
+            && pooled.height == height
+        {
+            return Ok(pooled.texture.clone());
+        }
+
+        let texture_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: self.pixel_format.as_dxgi(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+
+        let mut texture = None;
+        unsafe {
+            self.d3d_device
+                .CreateTexture2D(&texture_desc, None, Some(&mut texture))?;
+        };
+
+        let texture = texture.ok_or_else(windows::core::Error::from_win32)?;
+
+        if index < textures.len() {
+            textures[index] = PooledStagingTexture {
+                texture: texture.clone(),
+                width,
+                height,
+            };
+        } else {
+            textures.push(PooledStagingTexture {
+                texture: texture.clone(),
+                width,
+                height,
+            });
+        }
+
+        Ok(texture)
+    }
+}
+
+pub fn is_supported() -> windows::core::Result<bool> {
+    Ok(ApiInformation::IsApiContractPresentByMajor(
+        &HSTRING::from("Windows.Foundation.UniversalApiContract"),
+        8,
+    )? && GraphicsCaptureSession::IsSupported()?)
+}
+
+fn create_d3d_device_with_type(
+    driver_type: D3D_DRIVER_TYPE,
+    flags: D3D11_CREATE_DEVICE_FLAG,
+    device: *mut Option<ID3D11Device>,
+) -> windows::core::Result<()> {
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            driver_type,
+            HMODULE::default(),
+            flags,
+            None,
+            D3D11_SDK_VERSION,
+            Some(device),
+            None,
+            None,
+        )
+    }
+}
+
+fn create_d3d_device_on_pinned_adapter(
+    flags: D3D11_CREATE_DEVICE_FLAG,
+    device: *mut Option<ID3D11Device>,
+) -> Result<String, String> {
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+
+    let selected = cap_d3d_adapter::select_capture_adapter(None)?;
+
+    unsafe {
+        D3D11CreateDevice(
+            Some(&selected.adapter),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            flags,
+            None,
+            D3D11_SDK_VERSION,
+            Some(device),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            format!(
+                "D3D11CreateDevice failed on '{}': {e:?}",
+                selected.description
+            )
+        })?;
+    }
+
+    Ok(selected.description)
+}
+
+fn create_d3d_device_with_warp_fallback() -> windows::core::Result<(ID3D11Device, bool)> {
+    let mut device = None;
+    let flags = D3D11_CREATE_DEVICE_FLAG::default();
+
+    match create_d3d_device_on_pinned_adapter(flags, &mut device) {
+        Ok(description) => {
+            tracing::info!(
+                adapter = %description,
+                "scap-direct3d: D3D11 device created on pinned hardware adapter"
+            );
+            let device = device.ok_or_else(windows::core::Error::from_win32)?;
+            return Ok((device, false));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "scap-direct3d: pinned-adapter device creation failed, attempting default-hardware path"
+            );
+        }
+    }
+
+    let result = create_d3d_device_with_type(D3D_DRIVER_TYPE_HARDWARE, flags, &mut device);
+
+    match result {
+        Ok(()) => Ok((device.ok_or_else(windows::core::Error::from_win32)?, false)),
+        Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED => {
+            tracing::info!("Hardware D3D11 device unavailable, attempting WARP fallback");
+            create_d3d_device_with_type(D3D_DRIVER_TYPE_WARP, flags, &mut device)?;
+            Ok((device.ok_or_else(windows::core::Error::from_win32)?, true))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn create_copy_texture(
+    d3d_device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+) -> windows::core::Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: pixel_format.as_dxgi(),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+
+    let mut texture = None;
+    unsafe { d3d_device.CreateTexture2D(&desc, None, Some(&mut texture)) }?;
+    texture.ok_or_else(windows::core::Error::from_win32)
+}
+
+/// Textures for frames trimmed down from their surface. A frame hands its
+/// texture back when it is dropped, so a texture is only written again once
+/// no queued frame still reads it.
+#[derive(Default)]
+struct TrimPool {
+    free: Mutex<Vec<(ID3D11Texture2D, u32, u32)>>,
+}
+
+/// Enough for frames waiting on the encoder; more are dropped when returned.
+const TRIM_POOL_SIZE: usize = 8;
+
+impl TrimPool {
+    fn take(
+        &self,
+        d3d_device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+    ) -> windows::core::Result<ID3D11Texture2D> {
+        let reused = {
+            let mut free = self
+                .free
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            free.retain(|(_, w, h)| (*w, *h) == (width, height));
+            free.pop()
+        };
+        match reused {
+            Some((texture, _, _)) => Ok(texture),
+            None => create_copy_texture(d3d_device, width, height, pixel_format),
+        }
+    }
+
+    fn give(&self, texture: ID3D11Texture2D, width: u32, height: u32) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if free.len() < TRIM_POOL_SIZE {
+            free.push((texture, width, height));
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct Settings {
+    pub is_border_required: Option<bool>,
+    pub is_cursor_capture_enabled: Option<bool>,
+    pub min_update_interval: Option<Duration>,
+    pub pixel_format: PixelFormat,
+    pub crop: Option<D3D11_BOX>,
+    pub fps: Option<u32>,
+    /// Trim an odd-sized frame to the even size below it on the GPU, so a
+    /// consumer that encodes at even dimensions receives frames it can take as
+    /// they are. Ignored when `crop` is set.
+    pub even_dimensions: bool,
+    /// Follow the capture item when it changes size: recreate the frame pool
+    /// at the new size, and drop frames a `crop` box no longer fits inside.
+    /// Off by default so display and area captures behave as they always have.
+    pub follow_item_size: bool,
+}
+
+impl Settings {
+    pub fn can_is_border_required() -> windows::core::Result<bool> {
+        ApiInformation::IsPropertyPresent(
+            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+            &HSTRING::from("IsBorderRequired"),
+        )
+    }
+
+    pub fn can_is_cursor_capture_enabled() -> windows::core::Result<bool> {
+        ApiInformation::IsPropertyPresent(
+            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+            &HSTRING::from("IsCursorCaptureEnabled"),
+        )
+    }
+
+    pub fn can_min_update_interval() -> windows::core::Result<bool> {
+        ApiInformation::IsPropertyPresent(
+            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+            &HSTRING::from("MinUpdateInterval"),
+        )
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum NewCapturerError {
+    #[error("Screen capture requires Windows 10 version 1903 (build 18362) or later")]
+    WindowsVersionTooOld,
+    #[error(
+        "Windows Graphics Capture API is disabled or unavailable. This may be due to group policy or missing system components."
+    )]
+    GraphicsCaptureDisabled,
+    #[error("NotSupported")]
+    NotSupported,
+    #[error("BorderNotSupported")]
+    BorderNotSupported,
+    #[error("CursorNotSupported")]
+    CursorNotSupported,
+    #[error("UpdateIntervalNotSupported")]
+    UpdateIntervalNotSupported,
+    #[error("CreateDevice: {0}")]
+    CreateDevice(windows::core::Error),
+    #[error("CreateDevice: {0}")]
+    Context(windows::core::Error),
+    #[error("Direct3DDevice: {0}")]
+    Direct3DDevice(windows::core::Error),
+    #[error("CreateDevice: {0}")]
+    ItemSize(windows::core::Error),
+    #[error("FramePool: {0}")]
+    FramePool(windows::core::Error),
+    #[error("CaptureSession: {0}")]
+    CaptureSession(windows::core::Error),
+    #[error("CropTexture: {0}")]
+    CropTexture(windows::core::Error),
+    #[error("RegisterFrameArrived: {0}")]
+    RegisterFrameArrived(windows::core::Error),
+    #[error("RegisterClosed: {0}")]
+    RegisterClosed(windows::core::Error),
+    #[error("RecvTimeout")]
+    RecvTimeout(#[from] RecvError),
+    #[error("Other: {0}")]
+    Other(#[from] windows::core::Error),
+}
+
+pub struct Capturer {
+    settings: Settings,
+    d3d_device: ID3D11Device,
+    d3d_context: ID3D11DeviceContext,
+    session: GraphicsCaptureSession,
+    frame_pool: Direct3D11CaptureFramePool,
+    frame_arrived_token: i64,
+    stop_flag: Arc<AtomicBool>,
+    callback_activity: Arc<CallbackActivity>,
+    is_using_warp: bool,
+}
+
+impl Capturer {
+    pub fn new(
+        item: GraphicsCaptureItem,
+        settings: Settings,
+        mut callback: impl FnMut(Frame) -> windows::core::Result<()> + Send + 'static,
+        mut closed_callback: impl FnMut() -> windows::core::Result<()> + Send + 'static,
+        d3d_device: Option<ID3D11Device>,
+    ) -> Result<Capturer, NewCapturerError> {
+        if let Some(version) = WindowsVersion::detect() {
+            tracing::debug!(
+                version = %version.display_name(),
+                meets_requirements = version.meets_minimum_requirements(),
+                "Initializing screen capture"
+            );
+
+            if !version.meets_minimum_requirements() {
+                tracing::error!(
+                    version = %version.display_name(),
+                    required = "Windows 10 version 1903 (build 18362)",
+                    "Windows version does not meet minimum requirements"
+                );
+                return Err(NewCapturerError::WindowsVersionTooOld);
+            }
+        }
+
+        let api_present = ApiInformation::IsApiContractPresentByMajor(
+            &HSTRING::from("Windows.Foundation.UniversalApiContract"),
+            8,
+        )
+        .unwrap_or(false);
+
+        if !api_present {
+            return Err(NewCapturerError::WindowsVersionTooOld);
+        }
+
+        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+            return Err(NewCapturerError::GraphicsCaptureDisabled);
+        }
+
+        if settings.is_border_required.is_some() && !Settings::can_is_border_required()? {
+            return Err(NewCapturerError::BorderNotSupported);
+        }
+
+        if settings.is_cursor_capture_enabled.is_some()
+            && !Settings::can_is_cursor_capture_enabled()?
+        {
+            return Err(NewCapturerError::CursorNotSupported);
+        }
+
+        if settings.min_update_interval.is_some() && !Settings::can_min_update_interval()? {
+            return Err(NewCapturerError::UpdateIntervalNotSupported);
+        }
+
+        let (d3d_device, is_using_warp) = if let Some(device) = d3d_device {
+            (device, false)
+        } else {
+            create_d3d_device_with_warp_fallback().map_err(NewCapturerError::CreateDevice)?
+        };
+
+        let (d3d_device, d3d_context) = Some(d3d_device)
+            .map(|d| unsafe { d.GetImmediateContext() }.map(|v| (d, v)))
+            .transpose()
+            .map_err(NewCapturerError::Context)?
+            .unwrap();
+
+        if let Ok(multithread) = d3d_device.cast::<ID3D11Multithread>() {
+            unsafe {
+                let _ = multithread.SetMultithreadProtected(true);
+            }
+        }
+
+        let staging_pool = Arc::new(StagingTexturePool::new(
+            d3d_device.clone(),
+            settings.pixel_format,
+        ));
+
+        let item = item.clone();
+        let settings = settings.clone();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let callback_activity = Arc::new(CallbackActivity::new());
+
+        let direct3d_device = (|| {
+            let dxgi_device = d3d_device.cast::<IDXGIDevice>()?;
+            let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }?;
+            inspectable.cast::<IDirect3DDevice>()
+        })()
+        .map_err(NewCapturerError::Direct3DDevice)?;
+
+        let frame_pool_size = settings
+            .fps
+            .map(|fps| ((fps as f32 / 30.0 * 2.0).ceil() as i32).clamp(2, 4))
+            .unwrap_or(2);
+
+        let item_size = item.Size().map_err(NewCapturerError::ItemSize)?;
+
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &direct3d_device,
+            settings.pixel_format.as_directx(),
+            frame_pool_size,
+            item_size,
+        )
+        .map_err(NewCapturerError::FramePool)?;
+
+        let pool_size = Arc::new(Mutex::new((item_size.Width, item_size.Height)));
+
+        let session = frame_pool
+            .CreateCaptureSession(&item)
+            .map_err(NewCapturerError::CaptureSession)?;
+
+        if let Some(border_required) = settings.is_border_required {
+            session
+                .SetIsBorderRequired(border_required)
+                .map_err(NewCapturerError::Other)?;
+        }
+
+        if let Some(cursor_capture_enabled) = settings.is_cursor_capture_enabled {
+            session
+                .SetIsCursorCaptureEnabled(cursor_capture_enabled)
+                .map_err(NewCapturerError::Other)?;
+        }
+
+        if let Some(min_update_interval) = settings.min_update_interval {
+            session
+                .SetMinUpdateInterval(min_update_interval.into())
+                .map_err(NewCapturerError::Other)?;
+        }
+
+        let crop_data = settings
+            .crop
+            .map(|crop| {
+                let texture = create_copy_texture(
+                    &d3d_device,
+                    crop.right - crop.left,
+                    crop.bottom - crop.top,
+                    settings.pixel_format,
+                )
+                .map_err(NewCapturerError::CropTexture)?;
+
+                Ok::<_, NewCapturerError>((texture, crop))
+            })
+            .transpose()?;
+
+        // Only used by frames whose size differs from their surface (odd-sized,
+        // or smaller than the pool's surface), so a capture that matches its
+        // surface never pays for the copy.
+        let trim = Arc::new(TrimPool::default());
+
+        let frame_arrived_token = frame_pool
+            .FrameArrived(
+                &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new({
+                    let d3d_context = d3d_context.clone();
+                    let d3d_device = d3d_device.clone();
+                    let stop_flag = stop_flag.clone();
+                    let staging_pool = staging_pool.clone();
+                    let callback_activity = callback_activity.clone();
+                    let pixel_format = settings.pixel_format;
+                    let pool_size = pool_size.clone();
+                    let even_dimensions = settings.even_dimensions && settings.crop.is_none();
+                    let follow_item_size = settings.follow_item_size;
+
+                    move |frame_pool, _| {
+                        let _activity_guard = callback_activity.enter();
+
+                        if stop_flag.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+
+                        let Some(frame_pool) = frame_pool.as_ref() else {
+                            return Ok(());
+                        };
+
+                        let frame = frame_pool.TryGetNextFrame()?;
+
+                        let size = frame.ContentSize()?;
+
+                        // The item can change size mid-capture (a recorded
+                        // window is resized, or the display's resolution
+                        // changes). The pool keeps handing out surfaces at its
+                        // creation size, so the frame's own ContentSize stops
+                        // describing its texture and every later frame reads
+                        // back as black. Recreate the pool for the new size and
+                        // skip this frame; the next one arrives correctly sized.
+                        if follow_item_size {
+                            let mut pool_size = pool_size
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if (size.Width, size.Height) != *pool_size {
+                                drop(frame);
+                                // Windows.Graphics.Capture fails fast, on a
+                                // thread nothing here can catch, once its device
+                                // is removed. Do not hand it the removed device
+                                // again; report the removal instead.
+                                if let Err(error) = unsafe { d3d_device.GetDeviceRemovedReason() } {
+                                    tracing::error!(
+                                        %error,
+                                        "scap-direct3d: capture device removed, not recreating the frame pool"
+                                    );
+                                    return Err(error);
+                                }
+                                // IDirect3DDevice is not Send, so it is rebuilt
+                                // here from the capture device rather than held
+                                // across the event handler.
+                                let dxgi_device = d3d_device.cast::<IDXGIDevice>()?;
+                                let direct3d_device =
+                                    unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }?
+                                        .cast::<IDirect3DDevice>()?;
+                                frame_pool.Recreate(
+                                    &direct3d_device,
+                                    pixel_format.as_directx(),
+                                    frame_pool_size,
+                                    size,
+                                )?;
+                                *pool_size = (size.Width, size.Height);
+                                return Ok(());
+                            }
+                        }
+
+                        let surface = frame.Surface()?;
+                        let dxgi_interface = surface.cast::<IDirect3DDxgiInterfaceAccess>()?;
+                        let texture = unsafe { dxgi_interface.GetInterface::<ID3D11Texture2D>() }?;
+
+                        // ContentSize is the item's size when the frame was
+                        // captured, not the size of the surface it was written
+                        // to: it runs ahead of the surface whenever the item
+                        // grows before the pool is recreated, including frames
+                        // the old pool had already queued when `Recreate` ran.
+                        // Copies are bounded by the surface itself, because a
+                        // source box past its edge is undefined behaviour that
+                        // a hardware driver ignores but WARP answers by removing
+                        // the device, and Windows.Graphics.Capture then fails
+                        // fast on its next use of it.
+                        let mut surface_desc = D3D11_TEXTURE2D_DESC::default();
+                        unsafe { texture.GetDesc(&mut surface_desc) };
+                        let content_width = size.Width.max(0) as u32;
+                        let content_height = size.Height.max(0) as u32;
+
+                        // A frame queued before the pool was recreated: its
+                        // surface is the old size, and the next frame is not.
+                        if follow_item_size
+                            && (surface_desc.Width, surface_desc.Height)
+                                != (content_width, content_height)
+                        {
+                            return Ok(());
+                        }
+
+                        let frame = if let Some((cropped_texture, crop)) = crop_data.clone() {
+                            // A shrunk item leaves the crop box hanging off the
+                            // edge of the source texture, which copies nothing
+                            // and would vend a stale surface as if it were live.
+                            if crop.right > surface_desc.Width
+                                || crop.bottom > surface_desc.Height
+                                || (follow_item_size
+                                    && (crop.right > content_width
+                                        || crop.bottom > content_height))
+                            {
+                                return Ok(());
+                            }
+
+                            unsafe {
+                                d3d_context.CopySubresourceRegion(
+                                    &cropped_texture,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    &texture,
+                                    0,
+                                    Some(&crop),
+                                );
+                            }
+
+                            Frame {
+                                width: crop.right - crop.left,
+                                height: crop.bottom - crop.top,
+                                pixel_format: settings.pixel_format,
+                                inner: frame,
+                                texture: cropped_texture,
+                                d3d_context: d3d_context.clone(),
+                                d3d_device: d3d_device.clone(),
+                                staging_pool: staging_pool.clone(),
+                                recycle: None,
+                            }
+                        } else {
+                            // The frame is the content bounded by its surface,
+                            // floored to even when asked. A surface larger than
+                            // the content (a window item whose pool surface
+                            // includes the invisible resize borders) is copied
+                            // down to it: handing the whole surface over under
+                            // the content's size makes `as_buffer`'s
+                            // `CopyResource` a copy between different sizes,
+                            // which D3D11 drops, so the readback is all zeros.
+                            let mut width = content_width.min(surface_desc.Width);
+                            let mut height = content_height.min(surface_desc.Height);
+                            if even_dimensions {
+                                width &= !1;
+                                height &= !1;
+                            }
+                            if width == 0 || height == 0 {
+                                return Ok(());
+                            }
+
+                            if (width, height) == (surface_desc.Width, surface_desc.Height) {
+                                Frame {
+                                    width,
+                                    height,
+                                    pixel_format: settings.pixel_format,
+                                    inner: frame,
+                                    texture,
+                                    d3d_context: d3d_context.clone(),
+                                    d3d_device: d3d_device.clone(),
+                                    staging_pool: staging_pool.clone(),
+                                    recycle: None,
+                                }
+                            } else {
+                                let trimmed_texture =
+                                    trim.take(&d3d_device, width, height, pixel_format)?;
+
+                                unsafe {
+                                    d3d_context.CopySubresourceRegion(
+                                        &trimmed_texture,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        &texture,
+                                        0,
+                                        Some(&D3D11_BOX {
+                                            left: 0,
+                                            top: 0,
+                                            front: 0,
+                                            right: width,
+                                            bottom: height,
+                                            back: 1,
+                                        }),
+                                    );
+                                }
+
+                                Frame {
+                                    width,
+                                    height,
+                                    pixel_format: settings.pixel_format,
+                                    inner: frame,
+                                    texture: trimmed_texture,
+                                    d3d_context: d3d_context.clone(),
+                                    d3d_device: d3d_device.clone(),
+                                    staging_pool: staging_pool.clone(),
+                                    recycle: Some(trim.clone()),
+                                }
+                            }
+                        };
+
+                        (callback)(frame)
+                    }
+                }),
+            )
+            .map_err(NewCapturerError::RegisterFrameArrived)?;
+
+        item.Closed(
+            &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+                closed_callback()
+            }),
+        )
+        .map_err(NewCapturerError::RegisterClosed)?;
+
+        if is_using_warp {
+            tracing::warn!(
+                "Hardware GPU unavailable, using WARP software rasterizer for screen capture"
+            );
+        }
+
+        Ok(Capturer {
+            settings,
+            d3d_device,
+            d3d_context,
+            session,
+            frame_pool,
+            frame_arrived_token,
+            stop_flag,
+            callback_activity,
+            is_using_warp,
+        })
+    }
+
+    pub fn is_using_software_rendering(&self) -> bool {
+        self.is_using_warp
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn session(&self) -> &GraphicsCaptureSession {
+        &self.session
+    }
+
+    pub fn d3d_device(&self) -> &ID3D11Device {
+        &self.d3d_device
+    }
+
+    pub fn d3d_context(&self) -> &ID3D11DeviceContext {
+        &self.d3d_context
+    }
+}
+
+impl Capturer {
+    pub fn start(&mut self) -> windows::core::Result<()> {
+        self.session.StartCapture()
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum StopCapturerError {
+    #[error("NotStarted")]
+    NotStarted,
+    #[error("PostMessageFailed")]
+    PostMessageFailed,
+    #[error("ThreadJoinFailed")]
+    ThreadJoinFailed,
+}
+
+impl Capturer {
+    pub fn stop(&mut self) -> windows::core::Result<()> {
+        if self.stop_flag.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _ = self.frame_pool.RemoveFrameArrived(self.frame_arrived_token);
+        self.callback_activity.wait_idle(Duration::from_secs(2));
+        let _ = self.session.Close();
+        self.frame_pool.Close()
+    }
+}
+
+impl Drop for Capturer {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+pub struct Frame {
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    inner: Direct3D11CaptureFrame,
+    texture: ID3D11Texture2D,
+    d3d_device: ID3D11Device,
+    d3d_context: ID3D11DeviceContext,
+    staging_pool: Arc<StagingTexturePool>,
+    /// Where a trimmed frame's texture goes back to once the frame is done.
+    recycle: Option<Arc<TrimPool>>,
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if let Some(pool) = self.recycle.take() {
+            pool.give(self.texture.clone(), self.width, self.height);
+        }
+    }
+}
+
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+impl Frame {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.pixel_format
+    }
+
+    pub fn inner(&self) -> &Direct3D11CaptureFrame {
+        &self.inner
+    }
+
+    pub fn texture(&self) -> &ID3D11Texture2D {
+        &self.texture
+    }
+
+    pub fn d3d_device(&self) -> &ID3D11Device {
+        &self.d3d_device
+    }
+
+    pub fn d3d_context(&self) -> &ID3D11DeviceContext {
+        &self.d3d_context
+    }
+
+    pub fn as_buffer(&self) -> windows::core::Result<FrameBuffer<'_>> {
+        let staging_texture = self
+            .staging_pool
+            .get_or_create_texture(self.width, self.height)?;
+
+        unsafe {
+            self.d3d_context
+                .CopyResource(&staging_texture, &self.texture);
+        };
+
+        let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.d3d_context.Map(
+                &staging_texture,
+                0,
+                D3D11_MAP_READ,
+                0,
+                Some(&mut mapped_resource),
+            )?;
+        };
+
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                mapped_resource.pData.cast(),
+                (self.height * mapped_resource.RowPitch) as usize,
+            )
+        };
+
+        Ok(FrameBuffer {
+            data,
+            width: self.width,
+            height: self.height,
+            stride: mapped_resource.RowPitch,
+            pixel_format: self.pixel_format,
+            staging_texture,
+            d3d_context: self.d3d_context.clone(),
+        })
+    }
+}
+
+pub struct FrameBuffer<'a> {
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
+    staging_texture: ID3D11Texture2D,
+    d3d_context: ID3D11DeviceContext,
+}
+
+impl Drop for FrameBuffer<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.d3d_context.Unmap(&self.staging_texture, 0);
+        }
+    }
+}
+
+impl FrameBuffer<'_> {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.pixel_format
+    }
+}

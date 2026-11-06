@@ -1,0 +1,66 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.2.0/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": [
+			"**",
+			"!apps/web/public/gif.worker.js",
+			"!capcodec/**/*.tov",
+			"!capcodec/**/*.py",
+			"!capcodec/**/*.md",
+			"!capcodec/**/*.sh",
+			"!capcodec/**/*.jsonl",
+			"!capcodec/**/*.pyc",
+			"!capcodec/capcodec.bundle"
+		],
+		"ignoreUnknown": false
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab"
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"suspicious": {
+				"noShadowRestrictedNames": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	},
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": "on"
+			}
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["**/*.css"],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noUnknownAtRules": "off"
+					},
+					"correctness": {
+						"noUnknownTypeSelector": "off"
+					},
+					"style": {
+						"noDescendingSpecificity": "off"
+					}
+				}
+			}
+		}
+	]
+}
