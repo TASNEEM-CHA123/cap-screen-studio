@@ -284,7 +284,10 @@ fn submit_action_url(raw: &str) {
 /// window registry the actions dispatch into exists.
 pub fn init(cx: &mut App) {
     for argument in std::env::args().skip(1) {
-        if argument.starts_with("cap-desktop://") || argument.starts_with("cap://") {
+        if argument.starts_with("cap-test://")
+            || argument.starts_with("cap-desktop://")
+            || argument.starts_with("cap://")
+        {
             submit_action_url(&argument);
         }
     }

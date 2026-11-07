@@ -26,9 +26,9 @@ fn main() {
     println!("cargo:rerun-if-changed={icon}");
     tauri_winres::WindowsResource::new()
         .set_icon_with_id(icon, "1")
-        .set("ProductName", "Cap")
-        .set("FileDescription", "Cap")
-        .set("OriginalFilename", "Cap.exe")
+        .set("ProductName", "Cap Test")
+        .set("FileDescription", "Cap Test")
+        .set("OriginalFilename", "CapTest.exe")
         .compile()
         .expect("failed to compile the Cap Windows icon resource");
 }

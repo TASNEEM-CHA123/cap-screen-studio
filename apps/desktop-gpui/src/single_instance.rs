@@ -123,9 +123,9 @@ fn is_cap_gpui(pid: i32) -> bool {
 
 fn is_cap_gpui_image(path: &Path) -> bool {
     #[cfg(windows)]
-    const IMAGE_NAMES: [&str; 2] = ["Cap.exe", "cap-gpui.exe"];
+    const IMAGE_NAMES: [&str; 2] = ["CapTest.exe", "cap-test.exe"];
     #[cfg(not(windows))]
-    const IMAGE_NAMES: [&str; 2] = ["Cap", "cap-gpui"];
+    const IMAGE_NAMES: [&str; 2] = ["CapTest", "cap-test"];
 
     let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
         return false;
@@ -598,7 +598,9 @@ fn parse_linux_reopen_action(raw: &str) -> std::io::Result<crate::deeplink::Deep
         )
     };
     if raw.len() > MAX_FORWARDED_DEEP_LINK_BYTES
-        || !(raw.starts_with("cap-desktop://") || raw.starts_with("cap://"))
+        || !(raw.starts_with("cap-test://")
+            || raw.starts_with("cap-desktop://")
+            || raw.starts_with("cap://"))
     {
         return Err(invalid());
     }
@@ -1282,7 +1284,7 @@ fn is_forwardable_deep_link(url: &str) -> bool {
     !url.is_empty()
         && url.len() <= MAX_FORWARDED_DEEP_LINK_BYTES
         && reqwest::Url::parse(url)
-            .is_ok_and(|parsed| matches!(parsed.scheme(), "cap-desktop" | "cap"))
+            .is_ok_and(|parsed| matches!(parsed.scheme(), "cap-test" | "cap-desktop" | "cap"))
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1419,9 +1421,9 @@ mod tests {
     #[test]
     fn gpui_process_image_must_match_exactly() {
         #[cfg(windows)]
-        let names = ["cap-gpui.exe", "Cap.exe"];
+        let names = ["cap-test.exe", "CapTest.exe"];
         #[cfg(not(windows))]
-        let names = ["cap-gpui", "Cap"];
+        let names = ["cap-test", "CapTest"];
 
         for name in names {
             assert!(is_cap_gpui_image(Path::new(name)));

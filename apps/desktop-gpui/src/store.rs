@@ -171,14 +171,14 @@ pub fn app_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-            .join("Library/Application Support/so.cap.desktop")
+            .join("Library/Application Support/so.cap.desktop.test")
     }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("so.cap.desktop")
+            .join("so.cap.desktop.test")
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -188,7 +188,7 @@ pub fn app_data_dir() -> PathBuf {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
                     .join(".local/share")
             });
-        base.join("so.cap.desktop")
+        base.join("so.cap.desktop.test")
     }
 }
 
@@ -907,15 +907,15 @@ impl WindowExclusion {
 /// `DEFAULT_EXCLUDED_WINDOW_TITLES` in `general_settings.rs`, which is what
 /// the page's Reset button asks the backend for.
 pub const DEFAULT_EXCLUDED_WINDOW_TITLES: &[&str] = &[
-    "Cap",
-    "Cap Settings",
-    "Cap Recording Controls",
-    "Cap Camera",
-    "Cap Window Capture Occluder",
-    "Cap Capture Area",
-    "Cap Mode Selection",
-    "Cap Recordings Overlay",
-    "Cap Teleprompter",
+    "Cap Test",
+    "Cap Test Settings",
+    "Cap Test Recording Controls",
+    "Cap Test Camera",
+    "Cap Test Window Capture Occluder",
+    "Cap Test Capture Area",
+    "Cap Test Mode Selection",
+    "Cap Test Recordings Overlay",
+    "Cap Test Teleprompter",
 ];
 
 pub fn default_excluded_windows() -> Vec<WindowExclusion> {

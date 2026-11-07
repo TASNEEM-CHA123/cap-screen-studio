@@ -959,8 +959,8 @@ impl TrackKind {
             // The clip row's gutter label is "Video", not the definition's
             // "Clip" (`TL/index.tsx:1334`).
             Self::Clip => tr::editor::timeline::track::video(),
-            Self::MicAudio => "Mic",
-            Self::SystemAudio => "System",
+            Self::MicAudio => tr::editor::timeline::track::mic(),
+            Self::SystemAudio => tr::editor::timeline::track::system_audio(),
             Self::Style => tr::editor::timeline::track::style(),
             Self::Image => tr::editor::timeline::track::image(),
             Self::Caption => tr::editor::timeline::track::captions(),
@@ -977,7 +977,7 @@ impl TrackKind {
     pub fn icon(self) -> &'static str {
         match self {
             Self::Clip => "icons/clapperboard.svg",
-            Self::MicAudio => "icons/mic.svg",
+            Self::MicAudio => "icons/microphone.svg",
             Self::SystemAudio => "icons/music.svg",
             Self::Style => "icons/palette.svg",
             Self::Image => "icons/image.svg",
@@ -1021,8 +1021,8 @@ impl TrackKind {
     pub fn picker_description(self) -> &'static str {
         match self {
             Self::Clip => tr::editor::timeline::picker::clip(),
-            Self::MicAudio => "Mic audio waveform, mirrored from the video clip",
-            Self::SystemAudio => "System audio waveform, mirrored from the video clip",
+            Self::MicAudio => tr::editor::timeline::picker::mic(),
+            Self::SystemAudio => tr::editor::timeline::picker::system_audio(),
             Self::Style => tr::editor::timeline::picker::style(),
             Self::Image => tr::editor::timeline::picker::image(),
             Self::Zoom => tr::editor::timeline::picker::zoom(),
@@ -1041,8 +1041,8 @@ impl TrackKind {
     pub fn picker_remove(self) -> &'static str {
         match self {
             Self::Clip => tr::editor::timeline::remove::clip(),
-            Self::MicAudio => "Mic row is mirrored from the video clip",
-            Self::SystemAudio => "System row is mirrored from the video clip",
+            Self::MicAudio => tr::editor::timeline::remove::mic(),
+            Self::SystemAudio => tr::editor::timeline::remove::system_audio(),
             Self::Style => tr::editor::timeline::remove::style(),
             Self::Image => tr::editor::timeline::remove::image(),
             Self::Caption => tr::editor::timeline::remove::captions(),
@@ -1402,6 +1402,16 @@ impl TimelineModel {
     /// whether more than one recording clip exists (which decides `"Clip"` vs
     /// `"Clip N"`, `TL/ClipTrack.tsx:617-620`).
     pub fn build(config: &ProjectConfiguration, has_camera: bool, multiple_clips: bool) -> Self {
+        Self::build_with_audio(config, has_camera, multiple_clips, true, true)
+    }
+
+    pub fn build_with_audio(
+        config: &ProjectConfiguration,
+        has_camera: bool,
+        multiple_clips: bool,
+        has_mic: bool,
+        has_system: bool,
+    ) -> Self {
         let Some(timeline) = config.timeline.as_ref() else {
             return Self::default();
         };
@@ -1604,8 +1614,8 @@ impl TimelineModel {
             system_volume_db: config.audio.system_volume_db as f64,
             mic_muted: config.audio.mic_muted,
             system_muted: config.audio.system_muted,
-            has_mic: true,
-            has_system: true,
+            has_mic,
+            has_system,
             mic_waveforms: Vec::new(),
             system_waveforms: Vec::new(),
             waveform_paths: Arc::default(),
@@ -1626,7 +1636,19 @@ impl TimelineModel {
         multiple_clips: bool,
         lanes: &TrackLanes,
     ) -> Self {
-        let mut model = Self::build(config, has_camera, multiple_clips);
+        Self::build_with_lanes_and_audio(config, has_camera, multiple_clips, lanes, true, true)
+    }
+
+    pub fn build_with_lanes_and_audio(
+        config: &ProjectConfiguration,
+        has_camera: bool,
+        multiple_clips: bool,
+        lanes: &TrackLanes,
+        has_mic: bool,
+        has_system: bool,
+    ) -> Self {
+        let mut model =
+            Self::build_with_audio(config, has_camera, multiple_clips, has_mic, has_system);
         model.rows = build_rows(config, &model, has_camera, lanes);
         model
     }
@@ -3916,9 +3938,14 @@ fn label_body(
             .into_any_element(),
 
         (SegmentDetail::MicAudio { muted, .. }, LabelTier::Full) => label_row()
-            .child(label_primary(theme, color).child("Mic"))
+            .child(label_primary(theme, color).child(tr::editor::timeline::track::mic()))
             .when(*muted, |this| {
-                this.child(clip_badge(theme, color, "icons/volume-x.svg", "Muted"))
+                this.child(clip_badge(
+                    theme,
+                    color,
+                    "icons/volume-x.svg",
+                    tr::editor::timeline::segment::muted(),
+                ))
             })
             .into_any_element(),
         (SegmentDetail::MicAudio { muted, .. }, LabelTier::Compact) => label_row()
@@ -3931,7 +3958,7 @@ fn label_body(
                         .text_color(seg_label(theme, color)),
                 )
             })
-            .child(label_primary(theme, color).child("Mic"))
+            .child(label_primary(theme, color).child(tr::editor::timeline::track::mic()))
             .into_any_element(),
         (SegmentDetail::MicAudio { muted: true, .. }, LabelTier::Glyph) => label_glyph(
             theme,
@@ -3941,9 +3968,14 @@ fn label_body(
         ),
         (SegmentDetail::MicAudio { .. }, LabelTier::Glyph) => return None,
         (SegmentDetail::SystemAudio { muted, .. }, LabelTier::Full) => label_row()
-            .child(label_primary(theme, color).child("System"))
+            .child(label_primary(theme, color).child(tr::editor::timeline::track::system_audio()))
             .when(*muted, |this| {
-                this.child(clip_badge(theme, color, "icons/volume-x.svg", "Muted"))
+                this.child(clip_badge(
+                    theme,
+                    color,
+                    "icons/volume-x.svg",
+                    tr::editor::timeline::segment::muted(),
+                ))
             })
             .into_any_element(),
         (SegmentDetail::SystemAudio { muted, .. }, LabelTier::Compact) => label_row()
@@ -3956,7 +3988,7 @@ fn label_body(
                         .text_color(seg_label(theme, color)),
                 )
             })
-            .child(label_primary(theme, color).child("System"))
+            .child(label_primary(theme, color).child(tr::editor::timeline::track::system_audio()))
             .into_any_element(),
         (SegmentDetail::SystemAudio { muted: true, .. }, LabelTier::Glyph) => label_glyph(
             theme,
@@ -4547,6 +4579,8 @@ mod tests {
             rows,
             vec![
                 (TrackKind::Clip, 0),
+                (TrackKind::MicAudio, 0),
+                (TrackKind::SystemAudio, 0),
                 // Captions: no settings block, but the project has a caption
                 // segment, which is the fallback (`ED/context.ts:1414-1416`).
                 (TrackKind::Caption, 0),
@@ -4581,20 +4615,74 @@ mod tests {
         let with_camera = TimelineModel::build(&config, true, false);
         assert_eq!(
             with_camera.rows.len(),
-            3,
-            "clip + zoom + scene: {:?}",
+            5,
+            "clip + mic + system + zoom + scene: {:?}",
             with_camera.rows
         );
-        // Two rows means the roomier track height.
+        // Without the camera the scene row disappears, leaving four rows.
         let without_camera = TimelineModel::build(&config, false, false);
-        assert_eq!(without_camera.rows.len(), 2);
+        assert_eq!(without_camera.rows.len(), 4);
         assert_eq!(without_camera.track_height(), TRACK_HEIGHT);
 
         // `project.camera.hide` takes the row away again.
         let mut hidden = base;
         hidden["camera"] = serde_json::json!({ "hide": true });
         let hidden: ProjectConfiguration = serde_json::from_value(hidden).unwrap();
-        assert_eq!(TimelineModel::build(&hidden, true, false).rows.len(), 2);
+        assert_eq!(TimelineModel::build(&hidden, true, false).rows.len(), 4);
+    }
+
+    #[test]
+    fn mic_and_system_rows_are_gated_on_the_recording() {
+        let config: ProjectConfiguration = serde_json::from_value(serde_json::json!({
+            "timeline": {
+                "segments": [{ "recordingSegment": 0, "timescale": 1.0, "start": 0.0, "end": 5.0 }],
+                "zoomSegments": []
+            }
+        }))
+        .unwrap();
+
+        let both = TimelineModel::build_with_audio(&config, false, false, true, true);
+        assert!(
+            both.rows.iter().any(|row| row.kind == TrackKind::MicAudio),
+            "{:?}",
+            both.rows
+        );
+        assert!(
+            both.rows
+                .iter()
+                .any(|row| row.kind == TrackKind::SystemAudio),
+            "{:?}",
+            both.rows
+        );
+
+        let none = TimelineModel::build_with_audio(&config, false, false, false, false);
+        assert!(
+            !none.rows.iter().any(|row| row.kind == TrackKind::MicAudio),
+            "{:?}",
+            none.rows
+        );
+        assert!(
+            !none
+                .rows
+                .iter()
+                .any(|row| row.kind == TrackKind::SystemAudio),
+            "{:?}",
+            none.rows
+        );
+
+        let mic_only = TimelineModel::build_with_audio(&config, false, false, true, false);
+        assert!(
+            mic_only
+                .rows
+                .iter()
+                .any(|row| row.kind == TrackKind::MicAudio)
+        );
+        assert!(
+            !mic_only
+                .rows
+                .iter()
+                .any(|row| row.kind == TrackKind::SystemAudio)
+        );
     }
 
     /// A fullscreen text segment pauses the recording clock, so the clip box

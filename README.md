@@ -8,6 +8,8 @@
 	Beautiful, shareable screen recordings. Open source, fast, and built for teams that want to own their data.
 </p>
 
+> **Fork notice — Cap Test:** This repository is a downstream fork of [CapSoftware/Cap](https://github.com/CapSoftware/Cap) (the original Cap desktop app). The upstream Cap code is used here under its AGPLv3 license (see [LICENSE](LICENSE)); this fork adds a separated **Mic / System** audio workflow plus fixes and a distinct **Cap Test** identity so it can run side-by-side with an installed original Cap without sharing data or crashing into it. All Cap trademarks, logos, and upstream branding remain the property of their respective owners. See [Fork changes](#fork-changes-cap-test) and [Running Cap Test next to Cap](#running-cap-test-next-to-cap) below.
+
 <p align="center">
 	<a href="https://cap.so">Website</a>
 	 |
@@ -27,6 +29,69 @@
 </p>
 
 <img src="https://raw.githubusercontent.com/CapSoftware/Cap/refs/heads/main/apps/web/public/landing-cover.png" alt="Cap app preview">
+
+## Fork changes (Cap Test)
+
+This fork is derived from the upstream **Cap** project (Copyright © Cap Software, Inc.; AGPLv3 — see `LICENSE`). In addition to the upstream Cap desktop app, it adds:
+
+- **Separated Mic / System timeline.** The timeline shows a video row plus mirrored, read-only Mic and System waveform rows, each with its own mute and volume. Rows only appear when the recording actually has that audio. Preview, MP4 export, and audio-only export all honor per-source mute (`mic_muted` / `system_muted`).
+- **Audio-source choices.** MP4 export offers **Both / Mic / System**. Audio-only export offers **MP3** and **WAV** per selected source (WAV always; MP3 via libmp3lame/libshine/mp3_mf).
+- **Export fixes.** Planar S16 MP3 encoding with `frame_size()` chunking and `set_stream`/`write_interleaved`; audio-only export applies the source inside `AudioExportSettings::export` and renders only `sample_windows` for estimates; audio progress units match the UI total.
+- **Serde fix.** `AudioExportSettings.format` renamed to `audio_format` (`camelCase`) so `ExportSettings` (`#[serde(tag = "format")]`) JSON round-trips.
+- **Side-by-side identity.** The Windows build ships as **Cap Test / `CapTest.exe`** with its own app-data, logs, URL scheme, tray ID, and disabled updater endpoint so it does not overwrite or steal from an installed Cap. See next section.
+
+---
+
+## Running Cap Test next to Cap
+
+### Build prerequisites (Windows)
+
+- **Rust** via rustup (pinned toolchain in `rust-toolchain.toml`; GPUI needs 1.95.0 for release bundles).
+- **Bun 1.4.4**, **Node.js 24+**.
+- **FFmpeg 7.1** shared build + DXC + ONNX Runtime — handled by `bun run cap-setup` (downloads into `target/ffmpeg`, `target/native-deps`).
+- **Visual Studio 2022 BuildTools** (MSVC + CMake + Windows SDK) — `cap-setup` locates `libclang.dll` under `VC\Tools\LLVM` and writes `.cargo/config.toml` (`FFMPEG_DIR`, `LIBCLANG_PATH`, `CMAKE`, `ORT_DYLIB_PATH`).
+- **`libclang` compatible with `bindgen 0.70.1`** (LLVM 19.x). If you use a newer LLVM (e.g. 23), FFmpeg bindings come out opaque and fail; use the portable 19.1.7 tarball:
+
+  ```powershell
+  curl.exe -L -o "$env:LOCALAPPDATA\llvm-19.1.7\tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/clang+llvm-19.1.7-x86_64-pc-windows-msvc.tar.xz"
+  tar -xf "$env:LOCALAPPDATA\llvm-19.1.7\tar.xz" -C "$env:LOCALAPPDATA\llvm-19.1.7"
+  ```
+
+- **Patched GPUI checkout** at `../zed-cap` (relative to this repo) — fetched/applied by `scripts/prepare-gpui-dependency.sh`.
+
+### Build & run
+
+```powershell
+bun install
+bun run env-setup
+bun run cap-setup
+Set-Location apps\desktop-gpui
+cargo build -p cap-desktop-gpui --release   # -> target\release\cap-gpui.exe
+```
+
+Stage a runnable folder (exe + DLLs from the bundle mapping in `scripts/bundle-gpui.mjs`):
+
+```powershell
+Copy-Item target\release\cap-gpui.exe ..\..\mine\CapTest.exe
+Copy-Item ..\..\target\native-deps\dxc\*.dll ..\..\mine\
+Copy-Item ..\..\target\native-deps\onnxruntime\lib\*.dll ..\..\mine\
+Copy-Item ..\..\target\debug\av*.dll, "..\..\target\debug\postproc-58.dll", "..\..\target\debug\sw*.dll" ..\..\mine\
+```
+
+Then double-click `mine\CapTest.exe`. The main window title is **“Cap Test”** (tray: **“Cap Test”**).
+
+### How it avoids interfering with the original Cap
+
+|  | Original Cap (installed) | Cap Test (this fork) |
+|---|---|---|
+| Exe / product | `Cap.exe` / “Cap” | `CapTest.exe` / “Cap Test” |
+| App data (settings, recordings, PID, single-instance mutex) | `%APPDATA%\so.cap.desktop` | `%APPDATA%\so.cap.desktop.test` |
+| Logs / transcription / thumbnails / update staging | `%LOCALAPPDATA%\so.cap.desktop\…` | `%LOCALAPPDATA%\so.cap.desktop.test\…` |
+| Deep-link scheme | `cap-desktop://` | `cap-test://` (only `CapTest.exe` claims it) |
+| Tray / window titles | “Cap …” | “Cap Test …” |
+| Auto-updater | Cap CDN | disabled (`https://localhost/cap-test-update`) |
+
+**Caveat:** global hotkeys (`Ctrl+Shift+F9`) are OS-global — only one app can hold a combo. If both apps fight over a hotkey, change it in one app (Shortcuts settings). Everything else (recordings, settings, deep links, single-instance) is fully separate.
 
 Cap is the open source alternative to Loom. It gives you fast screen recording, polished local editing, instant share links, comments, transcripts, analytics, team workspaces, custom domains, custom S3 storage, and full self-hosting when you need complete control.
 

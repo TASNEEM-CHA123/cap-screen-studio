@@ -36,7 +36,7 @@ use crate::{permissions, store};
 /// `cap-desktop.log`: both apps write into the same directory on macOS, and a
 /// shared prefix would interleave two processes' lines into one file and make
 /// either app's "newest log" lookup pick up the other's.
-pub const LOG_FILE_PREFIX: &str = "cap-gpui.log";
+pub const LOG_FILE_PREFIX: &str = "cap-test.log";
 
 /// `MAX_SIZE` in `src-tauri/src/logging.rs`.
 
@@ -81,13 +81,13 @@ pub fn logs_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Library/Logs")
-            .join("so.cap.desktop")
+            .join("so.cap.desktop.test")
     }
     #[cfg(not(target_os = "macos"))]
     {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("so.cap.desktop")
+            .join("so.cap.desktop.test")
             .join("logs")
     }
 }

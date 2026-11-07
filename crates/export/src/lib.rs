@@ -20,6 +20,15 @@ use std::{
     },
 };
 
+pub(crate) fn apply_audio_source(project: &mut ProjectConfiguration, source: AudioSource) {
+    if !source.includes_mic() {
+        project.audio.mic_muted = true;
+    }
+    if !source.includes_system() {
+        project.audio.system_muted = true;
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ExportError {
     #[error("FFmpeg: {0}")]
@@ -133,12 +142,8 @@ impl ExporterBuilder {
 
         cap_editor::release_playback_audio_caches();
         let mut project_config = self.load_project_config()?;
-        let audio_source = self.audio_source;
-        if include_audio && !audio_source.includes_mic() {
-            project_config.audio.mic_muted = true;
-        }
-        if include_audio && !audio_source.includes_system() {
-            project_config.audio.system_muted = true;
+        if include_audio {
+            apply_audio_source(&mut project_config, self.audio_source);
         }
 
         let recording_meta =
@@ -556,6 +561,21 @@ impl ExporterBase {
         (fps as f64 * duration).ceil() as u32
     }
 
+    pub fn audio_progress_total(&self) -> u32 {
+        let duration = cap_rendering::get_duration(
+            &self.recordings,
+            &self.recording_meta,
+            &self.studio_meta,
+            &self.project_config,
+        );
+        if !duration.is_finite() || duration <= 0.0 {
+            return 0;
+        }
+        let total_samples =
+            (duration * f64::from(cap_editor::AudioRenderer::SAMPLE_RATE)).round() as usize;
+        total_samples.div_ceil(crate::audio::AUDIO_EXPORT_CHUNK_SAMPLES) as u32
+    }
+
     pub fn builder(project_path: PathBuf) -> ExporterBuilder {
         ExporterBuilder {
             project_path,
@@ -648,6 +668,25 @@ mod cursor_only_tests {
                 timeline.scene_segments[0].mode,
                 cap_project::SceneMode::SplitScreen
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_source_tests {
+    use super::*;
+
+    #[test]
+    fn selecting_a_source_mutes_the_other_one() {
+        for (source, mic_muted, system_muted) in [
+            (AudioSource::Both, false, false),
+            (AudioSource::Mic, false, true),
+            (AudioSource::System, true, false),
+        ] {
+            let mut project = ProjectConfiguration::default();
+            apply_audio_source(&mut project, source);
+            assert_eq!(project.audio.mic_muted, mic_muted, "{source:?}");
+            assert_eq!(project.audio.system_muted, system_muted, "{source:?}");
         }
     }
 }

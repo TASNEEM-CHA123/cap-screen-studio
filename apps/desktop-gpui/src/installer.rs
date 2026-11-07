@@ -12,13 +12,13 @@ use serde::Deserialize;
 
 use crate::store::UpdateChannel;
 
-const UPDATE_ENDPOINT: &str = "https://cdn.crabnebula.app/update/cap/cap";
+const UPDATE_ENDPOINT: &str = "https://localhost/cap-test-update";
 const UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUyOTAzOTdFNzJFQkRFOTMKUldTVDN1dHlmam1RNHFXb1VYTXlrQk1iMFFkcjN0YitqZlA5WnZNY0ZtQ1dvM1dxK211M3VIYUQK";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
-const STAGING_SLUG: &str = "cap";
+const STAGING_SLUG: &str = "cap-test";
 
 pub(crate) fn update_platform() -> Result<String, String> {
     let arch = if cfg!(target_arch = "aarch64") {
@@ -252,7 +252,7 @@ fn staging_root() -> PathBuf {
     }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("so.cap.desktop")
+        .join("so.cap.desktop.test")
         .join("updates")
 }
 

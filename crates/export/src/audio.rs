@@ -1,5 +1,6 @@
 use cap_editor::{AudioRenderer, get_audio_segments, load_music_tracks_uncached};
-use cap_project::{AudioExportFormat, AudioSource};
+use cap_project::{AudioExportFormat, AudioSource, ProjectConfiguration};
+use cap_rendering::FrameWindows;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::path::PathBuf;
@@ -7,12 +8,16 @@ use tracing::info;
 
 use crate::ExporterBase;
 
+pub const AUDIO_EXPORT_CHUNK_SAMPLES: usize = 1600;
+pub(crate) const AUDIO_EXPORT_FPS: u32 = 30;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Type)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioExportSettings {
     #[serde(default)]
     pub source: AudioSource,
     #[serde(default)]
-    pub format: AudioExportFormat,
+    pub audio_format: AudioExportFormat,
 }
 
 impl AudioExportSettings {
@@ -30,8 +35,10 @@ impl AudioExportSettings {
         mut on_progress: impl FnMut(u32) -> bool + Send + 'static,
     ) -> Result<PathBuf, String> {
         let mut output_path = base.output_path.clone();
-        if output_path.extension().and_then(|ext| ext.to_str()) != Some(self.format.extension()) {
-            output_path.set_extension(self.format.extension());
+        if output_path.extension().and_then(|ext| ext.to_str())
+            != Some(self.audio_format.extension())
+        {
+            output_path.set_extension(self.audio_format.extension());
         }
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -40,7 +47,8 @@ impl AudioExportSettings {
         let audio_segments = get_audio_segments(&base.segments).await;
         let music = load_music_tracks_uncached(&base.project_config, &base.project_path);
         let mut renderer = AudioRenderer::new(audio_segments).with_music(music);
-        let project = base.project_config.clone();
+        let mut project = base.project_config.clone();
+        crate::apply_audio_source(&mut project, self.source);
 
         let duration = cap_rendering::get_duration(
             &base.recordings,
@@ -51,43 +59,36 @@ impl AudioExportSettings {
         if !duration.is_finite() || duration <= 0.0 {
             return Err("There is nothing to export: the timeline is empty".to_string());
         }
-        let total_samples = (duration * f64::from(AudioRenderer::SAMPLE_RATE)).round() as usize;
 
         let mut rendered = Vec::new();
-        let mut written_samples = 0usize;
-        let chunk = 1600usize;
-        let mut chunk_index = 0u32;
-        while written_samples < total_samples {
-            let remaining = total_samples - written_samples;
-            let count = chunk.min(remaining);
-            let Some((samples, buffer)) = renderer.render_frame_raw(count, &project) else {
-                rendered.extend(std::iter::repeat_n(0.0, count * 2));
-                written_samples += count;
-                chunk_index += 1;
-                if !on_progress(chunk_index) {
-                    return Err("Export cancelled".to_string());
-                }
-                continue;
-            };
-            rendered.extend_from_slice(&buffer[..samples * 2]);
-            written_samples += samples;
-            chunk_index += 1;
-            if !on_progress(chunk_index) {
-                return Err("Export cancelled".to_string());
-            }
-            if samples == 0 {
-                break;
-            }
+        if let Some(windows) = base.sample_windows.clone() {
+            render_windows(
+                &mut renderer,
+                &mut rendered,
+                &windows,
+                &project,
+                base.sample_timing.as_deref(),
+                &mut on_progress,
+            )?;
+        } else {
+            let total_samples = (duration * f64::from(AudioRenderer::SAMPLE_RATE)).round() as usize;
+            render_full(
+                &mut renderer,
+                &mut rendered,
+                total_samples,
+                &project,
+                &mut on_progress,
+            )?;
         }
 
         info!(
             source = self.source.label(),
-            format = self.format.label(),
+            format = self.audio_format.label(),
             samples = rendered.len() / 2,
             "Rendered audio for audio-only export"
         );
 
-        match self.format {
+        match self.audio_format {
             AudioExportFormat::Wav => {
                 write_wav(&output_path, &rendered, AudioRenderer::SAMPLE_RATE, 2)
                     .map_err(|e| format!("Failed to write WAV: {e}"))?;
@@ -99,6 +100,73 @@ impl AudioExportSettings {
         }
         Ok(output_path)
     }
+}
+
+fn render_full(
+    renderer: &mut AudioRenderer,
+    rendered: &mut Vec<f32>,
+    total_samples: usize,
+    project: &ProjectConfiguration,
+    on_progress: &mut impl FnMut(u32) -> bool,
+) -> Result<(), String> {
+    let mut written_samples = 0usize;
+    let mut chunk_index = 0u32;
+    while written_samples < total_samples {
+        let remaining = total_samples - written_samples;
+        let count = AUDIO_EXPORT_CHUNK_SAMPLES.min(remaining);
+        match renderer.render_frame_raw(count, project) {
+            Some((samples, buffer)) => {
+                rendered.extend_from_slice(&buffer[..samples * 2]);
+                written_samples += samples;
+                if samples == 0 {
+                    break;
+                }
+            }
+            None => {
+                rendered.extend(std::iter::repeat_n(0.0, count * 2));
+                written_samples += count;
+            }
+        }
+        chunk_index += 1;
+        if !on_progress(chunk_index) {
+            return Err("Export cancelled".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn render_windows(
+    renderer: &mut AudioRenderer,
+    rendered: &mut Vec<f32>,
+    windows: &FrameWindows,
+    project: &ProjectConfiguration,
+    timing: Option<&crate::estimates::SampleTiming>,
+    on_progress: &mut impl FnMut(u32) -> bool,
+) -> Result<(), String> {
+    let samples_per_frame = (AudioRenderer::SAMPLE_RATE / AUDIO_EXPORT_FPS) as usize;
+    let mut chunk_index = 0u32;
+    for window in windows.windows() {
+        renderer.set_playhead(
+            f64::from(window.start) / f64::from(AUDIO_EXPORT_FPS),
+            project,
+        );
+        for frame in window.clone() {
+            match renderer.render_frame_raw(samples_per_frame, project) {
+                Some((samples, buffer)) => {
+                    rendered.extend_from_slice(&buffer[..samples * 2]);
+                }
+                None => rendered.extend(std::iter::repeat_n(0.0, samples_per_frame * 2)),
+            }
+            if let Some(timing) = timing {
+                timing.record_frame(frame);
+            }
+            chunk_index += 1;
+            if !on_progress(chunk_index) {
+                return Err("Export cancelled".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn write_wav(
@@ -139,75 +207,87 @@ fn write_mp3(
     sample_rate: u32,
     channels: u16,
 ) -> std::result::Result<(), String> {
-    ffmpeg::init().map_err(|e| format!("FFmpeg init failed: {e}"))?;
-    let path_str = path.to_str().ok_or("Invalid output path")?;
-    let mut output = ffmpeg::format::output::Output::new(path_str, "mp3")
-        .map_err(|e| format!("MP3 muxer unavailable: {e}"))?;
-
-    let mut codec_name = None;
-    for candidate in ["libmp3lame", "libshine", "mp3"] {
-        if ffmpeg::codec::encoder::find_by_name(candidate).is_some() {
-            codec_name = Some(candidate);
-            break;
-        }
+    if channels != 2 {
+        return Err("MP3 export expects stereo audio".to_string());
     }
-    let codec_name = codec_name
-        .ok_or("No MP3 encoder available (tried libmp3lame, libshine, mp3); use WAV instead")?;
-    let codec =
-        ffmpeg::codec::encoder::find_by_name(codec_name).ok_or("MP3 encoder disappeared")?;
-    let audio_codec = codec.audio().map_err(|e| e.to_string())?;
+    ffmpeg::init().map_err(|e| format!("FFmpeg init failed: {e}"))?;
+    let mut errors = Vec::new();
+    for candidate in ["libmp3lame", "libshine", "mp3_mf", "mp3"] {
+        match write_mp3_with_encoder(path, candidate, interleaved, sample_rate) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{candidate}: {error}")),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    Err(format!(
+        "No MP3 encoder succeeded ({}); use WAV instead",
+        errors.join("; ")
+    ))
+}
+
+fn write_mp3_with_encoder(
+    path: &std::path::Path,
+    codec_name: &str,
+    interleaved: &[f32],
+    sample_rate: u32,
+) -> std::result::Result<(), String> {
+    let codec = ffmpeg::codec::encoder::find_by_name(codec_name)
+        .ok_or_else(|| format!("encoder {codec_name} is unavailable"))?;
+    let mut output =
+        ffmpeg::format::output(path).map_err(|e| format!("MP3 muxer unavailable: {e}"))?;
     let context = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut encoder = context.encoder().audio().map_err(|e| e.to_string())?;
+    let sample_format = ffmpeg::format::Sample::I16(ffmpeg::format::sample::Type::Planar);
+    let layout = ffmpeg::ChannelLayout::STEREO;
     encoder.set_bit_rate(192_000);
     encoder.set_rate(sample_rate as i32);
-    encoder.set_format(ffmpeg::format::Sample::S16(
-        ffmpeg::format::sample::Type::Packed,
-    ));
-    encoder.set_channel_layout(ffmpeg::ChannelLayout::stereo());
+    encoder.set_format(sample_format);
+    encoder.set_channel_layout(layout);
     encoder.set_time_base(ffmpeg::Rational::new(1, sample_rate as i32));
-    let encoder = encoder
+    let mut encoder = encoder
         .open_with(ffmpeg::Dictionary::new())
         .map_err(|e| e.to_string())?;
     let mut stream = output.add_stream(codec).map_err(|e| e.to_string())?;
+    let index = stream.index();
     stream.set_time_base(ffmpeg::Rational::new(1, sample_rate as i32));
     stream.set_parameters(&encoder);
     output.write_header().map_err(|e| e.to_string())?;
 
-    let frames_total = interleaved.len() / channels as usize;
-    let chunk_frames = 4096usize;
-    let mut pts: i64 = 0;
+    let frame_size = (encoder.frame_size() as usize).max(1);
+    let frames_total = interleaved.len() / 2;
+    let mut frame = ffmpeg::frame::Audio::new(sample_format, frame_size, layout);
+    frame.set_rate(sample_rate);
+    let mut packet = ffmpeg::Packet::empty();
     let mut frame_index = 0usize;
+    let mut pts = 0i64;
     while frame_index < frames_total {
-        let count = chunk_frames.min(frames_total - frame_index);
-        let start = frame_index * channels as usize;
-        let end = start + count * channels as usize;
-        let mut frame = ffmpeg::frame::Audio::new(
-            ffmpeg::format::Sample::S16(ffmpeg::format::sample::Type::Packed),
-            count,
-            ffmpeg::ChannelLayout::stereo(),
-        );
-        frame.set_rate(sample_rate as i32);
+        let count = frame_size.min(frames_total - frame_index);
+        for plane_index in 0..2 {
+            let plane = frame.data_mut(plane_index);
+            plane.fill(0);
+            for i in 0..count {
+                let sample = interleaved[(frame_index + i) * 2 + plane_index].clamp(-1.0, 1.0);
+                let pcm = (sample * 32767.0).round() as i16;
+                plane[i * 2..i * 2 + 2].copy_from_slice(&pcm.to_le_bytes());
+            }
+        }
         frame.set_pts(Some(pts));
-        let data = frame.data_mut(0);
-        for i in 0..count * channels as usize {
-            let sample = interleaved[start + i].clamp(-1.0, 1.0);
-            let pcm = (sample * 32767.0).round() as i16;
-            data[i * 2..i * 2 + 2].copy_from_slice(&pcm.to_le_bytes());
-        }
         encoder.send_frame(&frame).map_err(|e| e.to_string())?;
-        let mut packet = ffmpeg::Packet::empty();
         while encoder.receive_packet(&mut packet).is_ok() {
-            packet.write(&mut output).map_err(|e| e.to_string())?;
-            packet = ffmpeg::Packet::empty();
+            packet.set_stream(index);
+            packet
+                .write_interleaved(&mut output)
+                .map_err(|e| e.to_string())?;
         }
-        pts += count as i64;
+        pts += frame_size as i64;
         frame_index += count;
     }
     encoder.send_eof().map_err(|e| e.to_string())?;
-    let mut packet = ffmpeg::Packet::empty();
     while encoder.receive_packet(&mut packet).is_ok() {
-        packet.write(&mut output).map_err(|e| e.to_string())?;
-        packet = ffmpeg::Packet::empty();
+        packet.set_stream(index);
+        packet
+            .write_interleaved(&mut output)
+            .map_err(|e| e.to_string())?;
     }
     output.write_trailer().map_err(|e| e.to_string())?;
     Ok(())
@@ -225,7 +305,7 @@ mod tests {
         write_wav(&path, &interleaved, 48_000, 2).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"RIFF"));
-        assert!(bytes.contains(&b"WAVE"));
+        assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(bytes.len(), 44 + interleaved.len() * 2);
         let data_offset = 44;
         let first = i16::from_le_bytes([bytes[data_offset], bytes[data_offset + 1]]);
@@ -239,11 +319,59 @@ mod tests {
     }
 
     #[test]
-    fn mp3_encoder_probe_does_not_panic() {
-        let _ = ffmpeg::init();
-        let found = ["libmp3lame", "libshine", "mp3"]
-            .iter()
-            .any(|name| ffmpeg::codec::encoder::find_by_name(name).is_some());
-        let _ = found;
+    fn mp3_round_trip_encodes_stereo_audio() {
+        ffmpeg::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.mp3");
+        let sample_rate = AudioRenderer::SAMPLE_RATE;
+        let frames = sample_rate as usize;
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let seconds = index as f32 / sample_rate as f32;
+            let sample = (seconds * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+            interleaved.push(sample);
+            interleaved.push(-sample);
+        }
+
+        write_mp3(&path, &interleaved, sample_rate, 2).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > 16_000,
+            "encoded MP3 is suspiciously small: {} bytes",
+            bytes.len()
+        );
+
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let (stream_index, parameters) = {
+            let stream = input.streams().best(ffmpeg::media::Type::Audio).unwrap();
+            (stream.index(), stream.parameters().clone())
+        };
+        let context = ffmpeg::codec::context::Context::from_parameters(parameters).unwrap();
+        let mut decoder = context.decoder().audio().unwrap();
+        let mut decoded = 0usize;
+        for (stream, packet) in input.packets() {
+            if stream.index() != stream_index {
+                continue;
+            }
+            decoder.send_packet(&packet).unwrap();
+            let mut frame = ffmpeg::frame::Audio::empty();
+            while decoder.receive_frame(&mut frame).is_ok() {
+                decoded += frame.samples();
+                frame = ffmpeg::frame::Audio::empty();
+            }
+        }
+        decoder.send_eof().unwrap();
+        let mut frame = ffmpeg::frame::Audio::empty();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            decoded += frame.samples();
+            frame = ffmpeg::frame::Audio::empty();
+        }
+
+        let error = (decoded as f64 - frames as f64).abs() / frames as f64;
+        assert!(
+            error < 0.05,
+            "decoded {decoded} samples for {frames} source frames"
+        );
     }
 }

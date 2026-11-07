@@ -117,7 +117,7 @@ fn transcription_model<'a>(
 fn app_local_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("so.cap.desktop")
+        .join("so.cap.desktop.test")
 }
 
 pub fn models_dir() -> PathBuf {
@@ -2401,7 +2401,7 @@ mod tests {
     #[test]
     fn model_paths_match_the_tauri_layout() {
         let base = models_dir();
-        assert!(base.ends_with("so.cap.desktop/transcription_models"));
+        assert!(base.ends_with("so.cap.desktop.test/transcription_models"));
         assert_eq!(model_path("best"), base.join("parakeet-best"));
         assert_eq!(model_path("best-max"), base.join("parakeet-best-max"));
         assert_eq!(model_path("small"), base.join("small.bin"));

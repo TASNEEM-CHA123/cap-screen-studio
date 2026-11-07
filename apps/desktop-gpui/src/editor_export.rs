@@ -393,7 +393,7 @@ impl ExportUi {
         } else if self.format.is_audio_only() {
             ExportSettings::Audio(AudioExportSettings {
                 source: self.audio_source,
-                format: if self.format == ExportFormatKind::Mp3 {
+                audio_format: if self.format == ExportFormatKind::Mp3 {
                     AudioExportFormat::Mp3
                 } else {
                     AudioExportFormat::Wav
@@ -3205,7 +3205,7 @@ async fn run_export(
     }
     let (base, total) = if format.is_audio_only() {
         let base = builder.build().await.map_err(|error| error.to_string())?;
-        let total = base.total_frames(fps);
+        let total = base.audio_progress_total();
         (PreparedBase::Audio(base), total)
     } else if !cursor_only && format != ExportFormatKind::Gif {
         let base = builder
@@ -3242,7 +3242,7 @@ async fn run_export(
         PreparedBase::Audio(base) => {
             AudioExportSettings {
                 source: audio_source,
-                format: if format == ExportFormatKind::Mp3 {
+                audio_format: if format == ExportFormatKind::Mp3 {
                     AudioExportFormat::Mp3
                 } else {
                     AudioExportFormat::Wav
